@@ -22,5 +22,8 @@ COPY . ./orchestrator/
 
 EXPOSE 8000
 
-# Shell form so $PORT (injected by Railway) expands at runtime
-CMD uvicorn orchestrator.main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Diagnostic startup — surface import errors before uvicorn swallows them.
+# Shell form so $PORT (injected by Railway) expands at runtime.
+CMD echo "[boot] PORT=$PORT DATABASE_URL=${DATABASE_URL:0:30}..." && \
+    python -c "import orchestrator.main; print('[boot] imports OK', flush=True)" && \
+    exec uvicorn orchestrator.main:app --host 0.0.0.0 --port ${PORT:-8000} --log-level info
