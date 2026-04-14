@@ -47,18 +47,33 @@ class MemoryStore:
         logger.info("Embedding model loaded")
 
     async def initialize(self):
-        """Create all tables + enable pgvector extension + add embedding columns."""
+        """Create all tables + enable pgvector extension + add embedding columns.
+
+        pgvector is optional at init — if the extension isn't available, we still
+        create the tables and log a warning. Semantic search then returns empty.
+        """
         async with self.engine.begin() as conn:
-            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+            try:
+                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                self._vector_enabled = True
+                logger.info("pgvector extension enabled")
+            except Exception as e:
+                self._vector_enabled = False
+                logger.warning("pgvector not available, semantic search disabled: %s", e)
+
             await conn.run_sync(Base.metadata.create_all)
-            # Vector-searchable tables
-            for tbl in ("semantic_memories", "battle_cards", "proposal_precedents"):
-                await conn.execute(
-                    text(
-                        f"ALTER TABLE {tbl} "
-                        f"ADD COLUMN IF NOT EXISTS embedding vector({self.embedding_dim})"
-                    )
-                )
+
+            if getattr(self, "_vector_enabled", False):
+                for tbl in ("semantic_memories", "battle_cards", "proposal_precedents"):
+                    try:
+                        await conn.execute(
+                            text(
+                                f"ALTER TABLE {tbl} "
+                                f"ADD COLUMN IF NOT EXISTS embedding vector({self.embedding_dim})"
+                            )
+                        )
+                    except Exception as e:
+                        logger.warning("Could not add embedding to %s: %s", tbl, e)
 
     # -- Conversations --
 

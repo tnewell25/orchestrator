@@ -55,20 +55,32 @@ bot_task: asyncio.Task | None = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global memory, agent, token_manager, audit_logger, telegram_bot, reminder_service, bot_task
+    global memory, agent, token_manager, audit_logger, telegram_bot, reminder_service, calendar_sync, proactive_monitor, bot_task
 
+    logger.info("=== Orchestrator startup ===")
     warnings = settings.validate_critical()
     for w in warnings:
         logger.warning("CONFIG: %s", w)
 
+    # Degraded-mode fallback — /health still responds so Railway healthcheck passes.
+    if not settings.database_url:
+        logger.error("DATABASE_URL missing — DEGRADED mode (agent disabled)")
+        yield
+        return
+
     # 1. Memory / DB
-    memory = MemoryStore(
-        database_url=settings.database_url,
-        embedding_model=settings.embedding_model,
-        embedding_dim=settings.embedding_dim,
-    )
-    await memory.initialize()
-    logger.info("Memory initialized")
+    try:
+        memory = MemoryStore(
+            database_url=settings.database_url,
+            embedding_model=settings.embedding_model,
+            embedding_dim=settings.embedding_dim,
+        )
+        await memory.initialize()
+        logger.info("Memory initialized")
+    except Exception as e:
+        logger.exception("Memory init failed — DEGRADED: %s", e)
+        yield
+        return
 
     audit_logger = AuditLogger(memory.session_maker)
 
@@ -125,25 +137,39 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Agent initialized with %d tools", len(agent.tools))
 
-    # 6. Telegram bot
+    # 6. Telegram bot (optional — fail soft)
     if settings.telegram_bot_token:
-        telegram_bot = TelegramBot(agent, settings)
-        await telegram_bot.start()
+        try:
+            telegram_bot = TelegramBot(agent, settings)
+            await telegram_bot.start()
+        except Exception as e:
+            logger.exception("Telegram bot failed to start: %s", e)
+            telegram_bot = None
     else:
         logger.warning("No TELEGRAM_BOT_TOKEN — bot not started")
 
-    # 7. Background services
-    reminder_service = ReminderService(sm, telegram_bot, agent=agent)
-    await reminder_service.start()
+    # 7. Background services (fail soft)
+    try:
+        reminder_service = ReminderService(sm, telegram_bot, agent=agent)
+        await reminder_service.start()
+    except Exception as e:
+        logger.exception("ReminderService failed: %s", e)
 
-    calendar_sync = CalendarAutoSync(
-        sm, calendar_skill, default_chat_id=default_chat_id
-    )
-    await calendar_sync.start()
+    try:
+        calendar_sync = CalendarAutoSync(
+            sm, calendar_skill, default_chat_id=default_chat_id
+        )
+        await calendar_sync.start()
+    except Exception as e:
+        logger.exception("CalendarAutoSync failed: %s", e)
 
-    proactive_monitor = ProactiveMonitor(sm, default_chat_id, settings)
-    await proactive_monitor.start()
+    try:
+        proactive_monitor = ProactiveMonitor(sm, default_chat_id, settings)
+        await proactive_monitor.start()
+    except Exception as e:
+        logger.exception("ProactiveMonitor failed: %s", e)
 
+    logger.info("=== Orchestrator ready ===")
     yield
 
     # Shutdown — reverse order
