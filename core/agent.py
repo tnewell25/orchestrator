@@ -1,4 +1,5 @@
 """Anthropic tool-use agent loop with Claude Max OAuth support."""
+import asyncio
 import json
 import logging
 import time
@@ -6,6 +7,13 @@ import time
 import anthropic
 
 logger = logging.getLogger(__name__)
+
+# Spread out tool-loop iterations so we don't burst against Claude Max OAuth's
+# per-account concurrency budget. 200ms between rounds is invisible to the user
+# but lets the server-side queue breathe.
+ITER_DELAY_S = 0.25
+# How many times we catch a RateLimitError ourselves (on TOP of SDK's retries).
+RATE_LIMIT_RETRIES = 3
 
 SYSTEM_PROMPT = """You are {agent_name}, the user's AI chief of staff.
 
@@ -128,16 +136,23 @@ class Agent:
                 self.tool_map[schema["name"]] = skill
 
     def _init_client(self):
+        # max_retries=5 so the SDK's built-in exponential backoff has more room
+        # (default is 2, which gives up in ~1.2s — way too eager for OAuth bursts).
+        # timeout bumped so slow-network retries aren't truncated.
+        common = {"max_retries": 5, "timeout": 120.0}
         if self.token_manager and self.token_manager.access_token:
             self.client = anthropic.AsyncAnthropic(
                 auth_token=self.token_manager.access_token,
                 default_headers={"anthropic-beta": "oauth-2025-04-20"},
+                **common,
             )
         elif self.token_manager and self.token_manager.api_key:
-            self.client = anthropic.AsyncAnthropic(api_key=self.token_manager.api_key)
+            self.client = anthropic.AsyncAnthropic(
+                api_key=self.token_manager.api_key, **common
+            )
         else:
             self.client = anthropic.AsyncAnthropic(
-                api_key=self.settings.anthropic_api_key
+                api_key=self.settings.anthropic_api_key, **common
             )
 
     def register_skill(self, skill):
@@ -189,33 +204,54 @@ class Agent:
                 messages.append({"role": msg["role"], "content": msg["content"]})
 
         recovered_this_run = False
-        for _ in range(self.max_iterations):
-            try:
-                response = await self.client.messages.create(
-                    model=model,
-                    max_tokens=4096,
-                    system=system,
-                    tools=self.tools if self.tools else anthropic.NOT_GIVEN,
-                    messages=messages,
-                )
-            except anthropic.AuthenticationError:
-                if not recovered_this_run and self.token_manager:
-                    recovered_this_run = True
-                    logger.warning("Auth error — running token recovery")
-                    recovered = await self.token_manager.handle_auth_error()
-                    if recovered:
-                        self._init_client()
-                        response = await self.client.messages.create(
-                            model=model,
-                            max_tokens=4096,
-                            system=system,
-                            tools=self.tools if self.tools else anthropic.NOT_GIVEN,
-                            messages=messages,
-                        )
-                    else:
-                        raise
-                else:
+        rl_retries_left = RATE_LIMIT_RETRIES
+
+        for iteration in range(self.max_iterations):
+            # Small cadence delay between iterations to avoid burst-triggering 429.
+            # Skip on iteration 0 (don't add latency to user's first response).
+            if iteration > 0:
+                await asyncio.sleep(ITER_DELAY_S)
+
+            response = None
+            while response is None:
+                try:
+                    response = await self.client.messages.create(
+                        model=model,
+                        max_tokens=4096,
+                        system=system,
+                        tools=self.tools if self.tools else anthropic.NOT_GIVEN,
+                        messages=messages,
+                    )
+                except anthropic.AuthenticationError:
+                    if not recovered_this_run and self.token_manager:
+                        recovered_this_run = True
+                        logger.warning("Auth error — running token recovery")
+                        recovered = await self.token_manager.handle_auth_error()
+                        if recovered:
+                            self._init_client()
+                            continue  # retry same iteration with fresh creds
                     raise
+                except anthropic.RateLimitError as e:
+                    # SDK already exhausted its exponential retries. Read the
+                    # server-provided Retry-After hint if present, else back off
+                    # aggressively (server-side burst caps want ~10-30s breathing room).
+                    retry_after = 15.0
+                    try:
+                        hdr = e.response.headers.get("retry-after") if getattr(e, "response", None) else None
+                        if hdr:
+                            retry_after = min(float(hdr), 60.0)
+                    except (ValueError, AttributeError):
+                        pass
+                    if rl_retries_left <= 0:
+                        logger.error("Rate limit exhausted after %d loop-level retries", RATE_LIMIT_RETRIES)
+                        raise
+                    rl_retries_left -= 1
+                    logger.warning(
+                        "Rate-limited. Waiting %.1fs before retry (%d loop retries left)",
+                        retry_after, rl_retries_left,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue  # retry same call
 
             if not any(b.type == "tool_use" for b in response.content):
                 final_text = "".join(
