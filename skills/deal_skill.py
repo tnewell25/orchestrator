@@ -147,10 +147,14 @@ class DealSkill(Skill):
             return {"id": d.id, "name": d.name, "stage": d.stage, "updated": True}
 
     @tool(
-        "Get full pipeline context for a deal: meetings, open action items, notes. "
-        "Use this when the user asks 'what's going on with X?' or before a meeting."
+        "Get full pipeline context for a deal: MEDDIC status, meetings, open action "
+        "items, bids, competitors. Use this when the user asks 'what's going on with X?' "
+        "or before a meeting. The MEDDIC gaps are flagged so the agent can nudge the "
+        "user to fill them in on the next call."
     )
     async def get_context(self, deal_id: str) -> dict:
+        from ..db.models import Bid, Contact
+
         async with self.session_maker() as s:
             d = await s.get(Deal, deal_id)
             if not d:
@@ -160,7 +164,7 @@ class DealSkill(Skill):
                     select(Meeting)
                     .where(Meeting.deal_id == deal_id)
                     .order_by(Meeting.date.desc())
-                    .limit(10)
+                    .limit(5)
                 )
             ).scalars().all()
             open_actions = (
@@ -170,6 +174,28 @@ class DealSkill(Skill):
                     .order_by(ActionItem.due_date.asc().nullslast())
                 )
             ).scalars().all()
+            bids = (
+                await s.execute(
+                    select(Bid).where(Bid.deal_id == deal_id).order_by(Bid.submission_deadline.asc().nullslast())
+                )
+            ).scalars().all()
+
+            ec = await s.get(Contact, d.economic_buyer_id) if d.economic_buyer_id else None
+            ch = await s.get(Contact, d.champion_id) if d.champion_id else None
+
+            meddic_gaps = [
+                field for field, val in [
+                    ("metrics", d.metrics),
+                    ("economic_buyer", d.economic_buyer_id),
+                    ("decision_criteria", d.decision_criteria),
+                    ("decision_process", d.decision_process),
+                    ("paper_process", d.paper_process),
+                    ("pain", d.pain),
+                    ("champion", d.champion_id),
+                    ("competitors", d.competitors),
+                ] if not val
+            ]
+
             return {
                 "deal": {
                     "id": d.id,
@@ -177,9 +203,19 @@ class DealSkill(Skill):
                     "stage": d.stage,
                     "value_usd": d.value_usd,
                     "close_date": str(d.close_date) if d.close_date else None,
-                    "competitors": d.competitors,
                     "next_step": d.next_step,
                     "notes": d.notes,
+                },
+                "meddic": {
+                    "metrics": d.metrics or None,
+                    "economic_buyer": {"id": ec.id, "name": ec.name, "title": ec.title} if ec else None,
+                    "decision_criteria": d.decision_criteria or None,
+                    "decision_process": d.decision_process or None,
+                    "paper_process": d.paper_process or None,
+                    "pain": d.pain or None,
+                    "champion": {"id": ch.id, "name": ch.name, "title": ch.title, "personal_notes": ch.personal_notes} if ch else None,
+                    "competitors": d.competitors or None,
+                    "gaps": meddic_gaps,  # agent should nudge user to fill these
                 },
                 "recent_meetings": [
                     {
@@ -199,4 +235,52 @@ class DealSkill(Skill):
                     }
                     for a in open_actions
                 ],
+                "bids": [
+                    {
+                        "id": b.id,
+                        "name": b.name,
+                        "stage": b.stage,
+                        "value_usd": b.value_usd,
+                        "submission_deadline": b.submission_deadline.isoformat() if b.submission_deadline else None,
+                    }
+                    for b in bids
+                ],
             }
+
+    @tool(
+        "Set MEDDIC stakeholders on a deal. Pass contact IDs. Either field optional — "
+        "only what's provided is updated. After setting, reminders to verify these "
+        "stakeholders should be set separately by the agent if this is new info."
+    )
+    async def set_stakeholders(
+        self,
+        deal_id: str,
+        economic_buyer_id: str = "",
+        champion_id: str = "",
+    ) -> dict:
+        async with self.session_maker() as s:
+            d = await s.get(Deal, deal_id)
+            if not d:
+                return {"error": f"Deal {deal_id} not found"}
+            if economic_buyer_id:
+                d.economic_buyer_id = economic_buyer_id
+            if champion_id:
+                d.champion_id = champion_id
+            await s.commit()
+            return {"id": d.id, "updated": True}
+
+    @tool(
+        "Update any MEDDIC qualitative field. field must be one of: metrics, "
+        "decision_criteria, decision_process, paper_process, pain."
+    )
+    async def set_meddic_field(self, deal_id: str, field: str, value: str) -> dict:
+        valid = {"metrics", "decision_criteria", "decision_process", "paper_process", "pain"}
+        if field not in valid:
+            return {"error": f"Invalid field '{field}'. Valid: {sorted(valid)}"}
+        async with self.session_maker() as s:
+            d = await s.get(Deal, deal_id)
+            if not d:
+                return {"error": f"Deal {deal_id} not found"}
+            setattr(d, field, value)
+            await s.commit()
+            return {"id": d.id, "field": field, "updated": True}

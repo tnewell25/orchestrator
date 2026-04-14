@@ -147,15 +147,29 @@ class Deal(Base):
     stage = Column(String, default="prospect", index=True)
     value_usd = Column(Float, default=0.0)
     close_date = Column(Date, nullable=True)
-    competitors = Column(Text, default="")  # comma-separated, kept simple
+    competitors = Column(Text, default="")  # comma-separated
     next_step = Column(Text, default="")
     notes = Column(Text, default="")
+
+    # MEDDIC — drives elite selling discipline. All optional, but get_context
+    # surfaces gaps so the agent nudges the user to fill them in next meeting.
+    economic_buyer_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    champion_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    metrics = Column(Text, default="")           # M — quantifiable impact ("reduce downtime 15%")
+    decision_criteria = Column(Text, default="")  # DC — what they're evaluating on
+    decision_process = Column(Text, default="")   # DP — how they'll decide
+    paper_process = Column(Text, default="")      # PP — legal/procurement/security steps
+    pain = Column(Text, default="")               # I — identified pain being solved
+
     created_at = Column(DateTime(timezone=True), default=_now)
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
     company = relationship("Company", back_populates="deals")
     meetings = relationship("Meeting", back_populates="deal", cascade="all, delete-orphan")
     action_items = relationship("ActionItem", back_populates="deal", cascade="all, delete-orphan")
+    bids = relationship("Bid", back_populates="deal", cascade="all, delete-orphan")
+    economic_buyer = relationship("Contact", foreign_keys=[economic_buyer_id])
+    champion = relationship("Contact", foreign_keys=[champion_id])
 
 
 class Meeting(Base):
@@ -198,7 +212,64 @@ class Note(Base):
     __tablename__ = "notes"
 
     id = Column(String, primary_key=True, default=_uuid)
-    subject_type = Column(String, nullable=False)  # "company" | "contact" | "deal"
+    subject_type = Column(String, nullable=False)  # "company" | "contact" | "deal" | "bid"
     subject_id = Column(String, nullable=False, index=True)
     content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class Bid(Base):
+    """RFP / bid / tender. Distinct from Deal because a single Deal may span
+    multiple bids, and some bids stand alone before being tied to a Deal.
+    Deadlines drive automatic reminders (T-7d / T-3d / T-1d)."""
+
+    __tablename__ = "bids"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    name = Column(String, nullable=False)
+    company_id = Column(String, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True)
+    deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # Deadlines — all UTC
+    submission_deadline = Column(DateTime(timezone=True), nullable=True, index=True)
+    qa_deadline = Column(DateTime(timezone=True), nullable=True)
+
+    value_usd = Column(Float, default=0.0)
+    # stage: evaluating | in_progress | submitted | won | lost | withdrawn
+    stage = Column(String, default="evaluating", index=True)
+
+    rfp_url = Column(String, default="")
+    deliverables = Column(Text, default="")  # what must be included in the submission
+    notes = Column(Text, default="")
+
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    deal = relationship("Deal", back_populates="bids")
+
+
+class Reminder(Base):
+    """Time-based prompts fired to the owner via the active messaging interface.
+    Polled every 30s by ReminderService; no APScheduler persistence complexity."""
+
+    __tablename__ = "reminders"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    trigger_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    message = Column(Text, nullable=False)
+
+    # Target channel
+    target_chat_id = Column(String, nullable=True)   # Telegram chat_id (as string for flexibility)
+    interface = Column(String, default="telegram")
+
+    # Context — what this reminder is about (rendered by the agent when it fires)
+    related_deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True, index=True)
+    related_meeting_id = Column(String, ForeignKey("meetings.id", ondelete="SET NULL"), nullable=True, index=True)
+    related_contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True, index=True)
+    related_bid_id = Column(String, ForeignKey("bids.id", ondelete="SET NULL"), nullable=True, index=True)
+    kind = Column(String, default="custom")  # custom | pre_meeting | bid_deadline | commitment
+
+    # Lifecycle
+    status = Column(String, default="pending", index=True)  # pending | sent | cancelled | failed
+    sent_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=_now)

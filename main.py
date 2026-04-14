@@ -10,13 +10,16 @@ from .config import get_settings
 from .core.agent import Agent
 from .core.audit import AuditLogger
 from .core.memory import MemoryStore
+from .core.reminder_service import ReminderService
 from .core.token_manager import TokenManager
 from .interfaces.telegram_bot import TelegramBot
+from .skills.bid_skill import BidSkill
 from .skills.briefing_skill import BriefingSkill
 from .skills.company_skill import CompanySkill
 from .skills.contact_skill import ContactSkill
 from .skills.deal_skill import DealSkill
 from .skills.meeting_skill import MeetingSkill
+from .skills.reminder_skill import ReminderSkill
 from .skills.task_skill import TaskSkill
 
 logging.basicConfig(
@@ -32,12 +35,13 @@ agent: Agent | None = None
 token_manager: TokenManager | None = None
 audit_logger: AuditLogger | None = None
 telegram_bot: TelegramBot | None = None
+reminder_service: ReminderService | None = None
 bot_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global memory, agent, token_manager, audit_logger, telegram_bot, bot_task
+    global memory, agent, token_manager, audit_logger, telegram_bot, reminder_service, bot_task
 
     warnings = settings.validate_critical()
     for w in warnings:
@@ -59,7 +63,12 @@ async def lifespan(app: FastAPI):
     await token_manager.initialize()
     logger.info("Token manager initialized (mode=%s)", token_manager.mode)
 
-    # 3. Skills — CRM domain
+    # 3. Default chat id for reminders — first allowed user (owner)
+    default_chat_id = (
+        str(settings.allowed_user_ids[0]) if settings.allowed_user_ids else ""
+    )
+
+    # 4. Skills — CRM domain + productivity
     sm = memory.session_maker
     skills = [
         CompanySkill(sm),
@@ -67,12 +76,14 @@ async def lifespan(app: FastAPI):
         DealSkill(sm),
         TaskSkill(sm),
         MeetingSkill(sm),
+        BidSkill(sm, default_chat_id=default_chat_id),
+        ReminderSkill(sm, default_chat_id=default_chat_id),
         BriefingSkill(sm),
     ]
     for s in skills:
         await s.setup()
 
-    # 4. Agent
+    # 5. Agent
     agent = Agent(
         memory=memory,
         skills=skills,
@@ -82,16 +93,22 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Agent initialized with %d tools", len(agent.tools))
 
-    # 5. Telegram bot
+    # 6. Telegram bot
     if settings.telegram_bot_token:
         telegram_bot = TelegramBot(agent, settings)
         await telegram_bot.start()
     else:
         logger.warning("No TELEGRAM_BOT_TOKEN — bot not started")
 
+    # 7. Reminder service — polls DB, delivers via telegram bot, enriches via agent
+    reminder_service = ReminderService(sm, telegram_bot, agent=agent)
+    await reminder_service.start()
+
     yield
 
     # Shutdown
+    if reminder_service:
+        await reminder_service.stop()
     if telegram_bot:
         await telegram_bot.stop()
     if memory:

@@ -11,6 +11,8 @@ from .models import (
     Meeting,
     ActionItem,
     Note,
+    Bid,
+    Reminder,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "Meeting",
     "ActionItem",
     "Note",
+    "Bid",
+    "Reminder",
 ]

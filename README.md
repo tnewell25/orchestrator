@@ -63,9 +63,56 @@ Alternatively, POST to `/tokens` at runtime to inject fresh tokens without a res
 3. Push this repo; Railway picks up `railway.toml` + `Dockerfile`.
 4. Set env vars in Railway dashboard: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_REFRESH_TOKEN`, `OPENAI_API_KEY` (for voice).
 
-## Roadmap
+## Reminders (v1.1)
 
-- v1 (shipping now): Telegram, CRM skills, voice capture, daily brief
-- v1.1: Vision (photos of business cards, whiteboards), LinkedIn research tool, proposal drafting
-- v1.5: Read-only web dashboard (Next.js) for pipeline view
-- v2: Microsoft Teams interface, multi-tenant auth, SSO, admin console (enterprise SKU)
+The agent can schedule proactive pings that arrive on Telegram at the right time, even after a restart (they're stored in Postgres and polled every 30s).
+
+**User patterns:**
+- "remind me in 2 hours to call Markus" → natural-language time parsing via `dateparser`
+- "ping me 30 min before the Bosch meeting" → `reminder-set_pre_meeting` auto-triggers a full context brief when it fires (last meetings, open actions, personal notes on the attendee)
+- Bid deadlines auto-schedule T-7d/T-3d/T-1d pings when created via `bid-create`
+
+**Kinds:** `custom`, `pre_meeting` (agent-enriched brief), `bid_deadline`, `commitment`.
+
+## MEDDIC discipline (v1.1)
+
+Deals track the full MEDDIC stack: Metrics, Economic buyer, Decision Criteria, Decision Process, Paper Process, Identified pain, Champion, Competition. When you ask the agent about a deal, it flags the gaps — "economic buyer unknown" — so you know what to dig for next conversation.
+
+## Bid/RFP tracking (v1.1)
+
+Separate entity from Deal. Tracks submission + Q&A deadlines, deliverables, value. Every new bid auto-schedules the full reminder sequence. Mark submitted → remaining pings cancel automatically.
+
+## Roadmap — elite features
+
+### v1.1 (shipped now)
+- Reminders with natural-language time + pre-meeting briefs
+- Bid/RFP tracking with auto-countdown
+- MEDDIC fields on Deals
+- CRM + voice capture + daily brief
+- Claude Max OAuth
+
+### v1.2 (next)
+- **Google Calendar integration** — reads calendar, auto-creates 30-min pre-meeting briefs for every meeting with a known contact
+- **Email draft skill** — "follow up with Markus about dinner, attach CM whitepaper" → Gmail draft ready to send
+- **Commitment drift detection** — "you told Markus you'd send the spec Fri. It's Mon." (via reminders + pending action items)
+- **Photo/vision** — business cards → contact record, whiteboards → notes
+
+### v1.5
+- **Competitor battle-card library** — surfaces win-playbook when Siemens MindSphere / GE Smart Signal / PTC ThingWorx / Rockwell FactoryTalk mentioned
+- **LinkedIn / company news intel** — auto-monitors pipeline companies for job changes, press releases, layoffs
+- **Travel intelligence** — "you're in Stuttgart next week, 4 Bosch contacts haven't been touched in 30+ days"
+- **Proposal drafting from precedent** — pulls best sections from past proposals via vector recall
+- **TTS replies** — hands-free morning brief via Telegram voice note
+- **Expense capture** — dinner receipt photo → categorized per deal
+
+### v2 (enterprise SKU for Bosch/Honeywell)
+- **Microsoft Teams interface** (Bot Framework + Azure AD SSO)
+- **Multi-tenant** — org-level isolation, RBAC, admin console
+- **On-prem LLM** — Azure OpenAI in tenant or Claude via Bedrock PrivateLink
+- **Compliance** — SOC 2 Type II, ISO 27001, GDPR DPA, IEC 62443 alignment
+- **Integrations** — SAP, Salesforce, ServiceNow, SharePoint
+- **Data residency** — EU (Bosch) / US (Honeywell)
+- **Multi-agent research swarm** — "investigate Honeywell Forge strategy" spawns parallel LinkedIn + news + Gartner workers
+- **Win/loss pattern mining** — vector-indexed deal history surfaces "we usually lose to Siemens when decision criterion X dominates"
+- **SMS bridge (Twilio)** — loop in clients who don't use Telegram
+
