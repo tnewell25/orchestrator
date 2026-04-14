@@ -39,7 +39,17 @@ class TokenManager:
         return "none"
 
     async def initialize(self):
-        """Load tokens from DB, seeding from env vars on first boot."""
+        """Load tokens from DB, seeding from env vars on first boot.
+
+        If ANTHROPIC_API_KEY is set AND no OAuth env vars are set, we skip
+        loading DB OAuth tokens — API key always wins. This avoids a stale
+        OAuth token in the DB forcing the agent into a broken OAuth path.
+        """
+        env_access = self.settings.anthropic_auth_token
+        if self.api_key and not env_access:
+            logger.info("API key present, no OAuth env → API key mode (skipping DB OAuth)")
+            return
+
         row = await self.memory.get_oauth_token("anthropic")
         if row and row["access_token"]:
             self.access_token = row["access_token"]
@@ -53,7 +63,6 @@ class TokenManager:
             )
             return
 
-        env_access = self.settings.anthropic_auth_token
         env_refresh = self.settings.anthropic_refresh_token
         if env_access:
             self.access_token = env_access
