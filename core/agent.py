@@ -15,7 +15,7 @@ ITER_DELAY_S = 0.25
 # How many times we catch a RateLimitError ourselves (on TOP of SDK's retries).
 RATE_LIMIT_RETRIES = 3
 
-SYSTEM_PROMPT = """You are {agent_name}, the user's AI chief of staff.
+STATIC_SYSTEM_PROMPT = """You are {agent_name}, the user's AI chief of staff.
 
 The user is a senior sales engineer selling industrial/enterprise solutions to
 large firms (Bosch, Honeywell, GE, Rockwell, Siemens, Emerson, etc). Sales
@@ -102,10 +102,22 @@ COMPETITORS
 NEVER
 - Invent data. If you don't know, say so or look it up via research-search.
 - Ask permission to log something the user already told you.
-- Output lists with more than 10 items on mobile — summarize and offer drill-down.
+- Output lists with more than 10 items on mobile — summarize and offer drill-down."""
 
-{facts_context}
-{memories_context}"""
+
+def _build_dynamic_context(facts: list, memories: list) -> str:
+    """Facts + memories change per-request — kept separate so the static prompt
+    (above) + tools can be cache_controlled for 10x TPM savings."""
+    parts = []
+    if facts:
+        parts.append("Known facts:\n" + "\n".join(
+            f"- [{f['category']}] {f['key']}: {f['value']}" for f in facts
+        ))
+    if memories:
+        parts.append("Relevant memories:\n" + "\n".join(
+            f"- {m['content']}" for m in memories
+        ))
+    return "\n\n".join(parts) if parts else ""
 
 
 class Agent:
@@ -134,6 +146,27 @@ class Agent:
             for schema in skill.get_tools():
                 self.tools.append(schema)
                 self.tool_map[schema["name"]] = skill
+
+    def _cache_controlled_tools(self) -> list:
+        """Attach cache_control to the last tool so the entire tools block gets
+        cached. Subsequent identical requests cost ~10% of the normal input tokens."""
+        if not self.tools:
+            return self.tools
+        tools_out = [dict(t) for t in self.tools]
+        # Only the LAST tool needs cache_control — caching is from start→marker.
+        tools_out[-1] = {**tools_out[-1], "cache_control": {"type": "ephemeral"}}
+        return tools_out
+
+    def _build_system(self, static: str, dynamic: str) -> list:
+        """System prompt as content-block list: static part is cached (marked
+        with cache_control), dynamic per-call facts/memories append fresh.
+        Cache hit = ~10% of normal input cost for the cached prefix + tools."""
+        blocks = [
+            {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}}
+        ]
+        if dynamic:
+            blocks.append({"type": "text", "text": dynamic})
+        return blocks
 
     def _init_client(self):
         # max_retries=5 so the SDK's built-in exponential backoff has more room
@@ -180,23 +213,10 @@ class Agent:
         facts = await self.memory.get_facts()
         memories = await self.memory.recall(message, limit=5)
 
-        facts_ctx = ""
-        if facts:
-            facts_ctx = "Known facts:\n" + "\n".join(
-                f"- [{f['category']}] {f['key']}: {f['value']}" for f in facts
-            )
-
-        memories_ctx = ""
-        if memories:
-            memories_ctx = "Relevant memories:\n" + "\n".join(
-                f"- {m['content']}" for m in memories
-            )
-
-        system = SYSTEM_PROMPT.format(
-            agent_name=self.settings.agent_name,
-            facts_context=facts_ctx,
-            memories_context=memories_ctx,
+        static_system = STATIC_SYSTEM_PROMPT.format(
+            agent_name=self.settings.agent_name
         )
+        dynamic_system = _build_dynamic_context(facts, memories)
 
         messages = []
         for msg in conversation:
@@ -218,8 +238,8 @@ class Agent:
                     response = await self.client.messages.create(
                         model=model,
                         max_tokens=4096,
-                        system=system,
-                        tools=self.tools if self.tools else anthropic.NOT_GIVEN,
+                        system=self._build_system(static_system, dynamic_system),
+                        tools=self._cache_controlled_tools() if self.tools else anthropic.NOT_GIVEN,
                         messages=messages,
                     )
                 except anthropic.AuthenticationError:
