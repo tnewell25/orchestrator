@@ -88,6 +88,68 @@ class BriefingSkill(Skill):
                 ],
             }
 
+    @tool(
+        "Morning brief — structured data for the agent to narrate in TTS-friendly "
+        "prose (short sentences, no markdown, spoken-word flow). Used for "
+        "hands-free driving playback. Includes: top 3 priorities today, first "
+        "meeting context, overdue items, any proactive alerts."
+    )
+    async def morning_brief(self) -> dict:
+        today = datetime.now(timezone.utc).date()
+        end_of_day = datetime.now(timezone.utc).replace(hour=23, minute=59)
+
+        async with self.session_maker() as s:
+            overdue = (
+                await s.execute(
+                    select(ActionItem)
+                    .where(
+                        ActionItem.status == "open",
+                        ActionItem.due_date <= today,
+                    )
+                    .order_by(ActionItem.due_date.asc())
+                    .limit(3)
+                )
+            ).scalars().all()
+
+            today_meetings = (
+                await s.execute(
+                    select(Meeting)
+                    .where(
+                        Meeting.date >= datetime.now(timezone.utc),
+                        Meeting.date <= end_of_day,
+                    )
+                    .order_by(Meeting.date.asc())
+                    .limit(5)
+                )
+            ).scalars().all()
+
+            # Deals closing this week
+            from ..db.models import Deal
+            week_ahead = today + timedelta(days=7)
+            closing = (
+                await s.execute(
+                    select(Deal).where(
+                        Deal.close_date >= today,
+                        Deal.close_date <= week_ahead,
+                        Deal.stage.notin_(["closed_won", "closed_lost"]),
+                    )
+                )
+            ).scalars().all()
+
+            return {
+                "tts_friendly": True,
+                "top_overdue": [
+                    {"description": a.description, "due_date": str(a.due_date) if a.due_date else None}
+                    for a in overdue
+                ],
+                "today_meetings": [
+                    {"summary": m.summary[:150], "date": str(m.date)}
+                    for m in today_meetings
+                ],
+                "deals_closing_this_week_count": len(closing),
+                "deals_closing_this_week_total_value": sum(d.value_usd for d in closing),
+            }
+
     @tool("Snapshot of the pipeline: count and total value by stage.")
     async def pipeline_snapshot(self) -> dict:
         async with self.session_maker() as s:

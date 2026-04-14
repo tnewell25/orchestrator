@@ -35,6 +35,13 @@ class Settings(BaseSettings):
     google_credentials_path: str = ""
     google_user_email: str = ""
 
+    # Research (optional — Serper for cleaner google results; DDG scraping fallback)
+    serper_api_key: str = ""
+
+    # Proactive monitor tuning
+    stalled_deal_days: int = 14
+    unanswered_email_days: int = 5
+
     @property
     def allowed_user_ids(self) -> list[int]:
         if not self.telegram_allowed_users:

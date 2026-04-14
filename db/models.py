@@ -248,6 +248,299 @@ class Bid(Base):
     deal = relationship("Deal", back_populates="bids")
 
 
+class User(Base):
+    """A person using the system (sales engineer, PM, tech, foreman, admin).
+    Role drives what the agent emphasizes in responses."""
+
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    telegram_user_id = Column(String, unique=True, nullable=True, index=True)
+    name = Column(String, nullable=False)
+    email = Column(String, default="")
+    phone = Column(String, default="")
+    # role: owner | sales_engineer | project_manager | foreman | technician | dispatcher | admin
+    role = Column(String, default="sales_engineer", index=True)
+    active = Column(String, default="yes")  # "yes" | "no"
+    # Tech-specific fields (used when role includes technician/foreman)
+    trade_level = Column(String, default="")  # apprentice | j-man | master | foreman | gf
+    hourly_rate_usd = Column(Float, default=0.0)
+    certifications = Column(Text, default="")  # comma-separated with expiry dates in freeform
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class Job(Base):
+    """A field job / work order. Bridges from won bid/deal → actual execution."""
+
+    __tablename__ = "jobs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_number = Column(String, unique=True, index=True)  # internal job code e.g. "25-0142"
+    name = Column(String, nullable=False)
+    company_id = Column(String, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True)
+    deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True, index=True)
+    bid_id = Column(String, ForeignKey("bids.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    # Site info
+    site_address = Column(String, default="")
+    site_contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    gc_name = Column(String, default="")  # general contractor if sub work
+
+    # Scope + budget
+    scope = Column(Text, default="")
+    contract_value_usd = Column(Float, default=0.0)
+    labor_budget_hours = Column(Float, default=0.0)
+    material_budget_usd = Column(Float, default=0.0)
+
+    # Status
+    # stage: scheduled | in_progress | punch | inspected | closed_out | warranty
+    stage = Column(String, default="scheduled", index=True)
+    scheduled_start = Column(Date, nullable=True)
+    scheduled_end = Column(Date, nullable=True)
+    actual_start = Column(Date, nullable=True)
+    actual_end = Column(Date, nullable=True)
+
+    # PM assignment
+    project_manager_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    foreman_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class Timesheet(Base):
+    """A single labor entry. Geofence/voice-driven clock in/out."""
+
+    __tablename__ = "timesheets"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    clock_in = Column(DateTime(timezone=True), nullable=False, default=_now)
+    clock_out = Column(DateTime(timezone=True), nullable=True)
+    hours = Column(Float, default=0.0)  # computed or manually entered
+    billable = Column(String, default="yes")
+    source = Column(String, default="manual")  # manual | geofence | voice
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class DailyLog(Base):
+    """End-of-day recap per tech per job. Auto-generated from voice notes.
+    Drives the PM/client email that replaces the form-filling tax."""
+
+    __tablename__ = "daily_logs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    log_date = Column(Date, nullable=False, default=lambda: _now().date(), index=True)
+
+    summary = Column(Text, default="")
+    work_performed = Column(Text, default="")
+    issues = Column(Text, default="")          # anything that blocked or slowed the crew
+    materials_used = Column(Text, default="")  # freeform or structured JSON-like
+    hours_total = Column(Float, default=0.0)
+    next_day_plan = Column(Text, default="")
+    transcript = Column(Text, default="")      # raw voice-note text if voice-driven
+
+    # Did this log get emailed to client / PM?
+    emailed_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class ChangeOrder(Base):
+    """Captured mid-job scope changes. Biggest source of revenue leakage if not tracked."""
+
+    __tablename__ = "change_orders"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    created_by_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # status: draft | pm_review | submitted | approved | rejected | invoiced
+    status = Column(String, default="draft", index=True)
+    co_number = Column(String, default="")  # e.g. "CO-001"
+
+    requested_by = Column(String, default="")  # customer rep name
+    description = Column(Text, nullable=False)
+    labor_hours = Column(Float, default=0.0)
+    material_cost_usd = Column(Float, default=0.0)
+    price_usd = Column(Float, default=0.0)
+
+    captured_source = Column(String, default="voice")  # voice | manual | email
+    approved_at = Column(DateTime(timezone=True), nullable=True)
+    approver = Column(String, default="")  # who on customer side approved
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class JobPhoto(Base):
+    """Photo record with searchable metadata. File lives elsewhere (S3 later);
+    here we store reference + tags."""
+
+    __tablename__ = "job_photos"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    taken_at = Column(DateTime(timezone=True), default=_now, index=True)
+
+    storage_url = Column(String, default="")   # S3/GCS path (future)
+    telegram_file_id = Column(String, default="")  # Telegram's file_id for immediate re-fetch
+    caption = Column(Text, default="")
+    tags = Column(Text, default="")  # comma-separated: "panel,mcc-2,as-built"
+    location_desc = Column(String, default="")  # "Room 204", "East wall"
+
+    # Category for quick filtering
+    # category: install | as_built | issue | pre_inspection | post_inspection | safety | material | receipt
+    category = Column(String, default="install", index=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class PunchlistItem(Base):
+    """Items remaining at end of job. Tracked to unlock final payment."""
+
+    __tablename__ = "punchlist_items"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    description = Column(Text, nullable=False)
+    location = Column(String, default="")
+    assigned_to_user_id = Column(String, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # status: open | in_progress | done | waived
+    status = Column(String, default="open", index=True)
+    completion_photo_id = Column(String, ForeignKey("job_photos.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Inspection(Base):
+    """AHJ / owner / commissioning inspections."""
+
+    __tablename__ = "inspections"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    # kind: rough | final | commissioning | fire_alarm | owner_walkthrough | other
+    kind = Column(String, nullable=False)
+    scheduled_at = Column(DateTime(timezone=True), nullable=True)
+    inspector_name = Column(String, default="")
+    jurisdiction = Column(String, default="")  # city/county AHJ name
+    # status: scheduled | passed | failed | rescheduled
+    status = Column(String, default="scheduled", index=True)
+    result_notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class DealStakeholder(Base):
+    """Contact's role in a specific deal. A person can play different roles on
+    different deals, so this is a join with role metadata."""
+
+    __tablename__ = "deal_stakeholders"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    deal_id = Column(String, ForeignKey("deals.id", ondelete="CASCADE"), nullable=False, index=True)
+    contact_id = Column(String, ForeignKey("contacts.id", ondelete="CASCADE"), nullable=False, index=True)
+    # role: champion | economic_buyer | technical_buyer | blocker | coach | user
+    role = Column(String, nullable=False, index=True)
+    # sentiment: supportive | neutral | opposed | unknown
+    sentiment = Column(String, default="unknown")
+    influence = Column(String, default="medium")  # low | medium | high
+    notes = Column(Text, default="")
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    __table_args__ = (
+        UniqueConstraint("deal_id", "contact_id", "role", name="uq_deal_stake_role"),
+    )
+
+
+class Competitor(Base):
+    __tablename__ = "competitors"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    name = Column(String, nullable=False, unique=True, index=True)
+    aliases = Column(Text, default="")
+    strengths = Column(Text, default="")
+    weaknesses = Column(Text, default="")
+    pricing_notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class BattleCard(Base):
+    """Reusable content for beating a competitor. Embedding column added in MemoryStore.initialize."""
+
+    __tablename__ = "battle_cards"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    competitor_id = Column(String, ForeignKey("competitors.id", ondelete="CASCADE"), nullable=True)
+    situation = Column(Text, default="")
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class WinLossRecord(Base):
+    __tablename__ = "win_loss_records"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    deal_id = Column(String, ForeignKey("deals.id", ondelete="CASCADE"), nullable=False, index=True)
+    outcome = Column(String, nullable=False)
+    winning_competitor = Column(String, default="")
+    primary_reason = Column(Text, default="")
+    what_worked = Column(Text, default="")
+    what_didnt = Column(Text, default="")
+    lessons = Column(Text, default="")
+    value_usd = Column(Float, default=0.0)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class EmailTrack(Base):
+    """Tracks outgoing emails so we can nudge if no reply."""
+
+    __tablename__ = "email_tracks"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    gmail_message_id = Column(String, index=True)
+    thread_id = Column(String, default="")
+    to_address = Column(String, default="")
+    subject = Column(String, default="")
+    sent_at = Column(DateTime(timezone=True), default=_now, index=True)
+    related_deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True)
+    related_contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    status = Column(String, default="awaiting_reply", index=True)
+    nudge_after_days = Column(Integer, default=5)
+    last_reminded_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class ProposalPrecedent(Base):
+    """Reusable proposal section/paragraph. Embedding added via raw SQL at init."""
+
+    __tablename__ = "proposal_precedents"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    title = Column(String, nullable=False)
+    section_type = Column(String, default="")  # intro | scope | pricing | warranty | etc.
+    content = Column(Text, nullable=False)
+    tags = Column(Text, default="")  # comma-separated context tags
+    source_deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class WarrantyRecord(Base):
+    """Per-job warranty tracking for post-closeout service calls."""
+
+    __tablename__ = "warranty_records"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_id = Column(String, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True)
+    warranty_start = Column(Date, nullable=True)
+    warranty_end = Column(Date, nullable=True, index=True)
+    coverage = Column(Text, default="")  # what's covered
+    exclusions = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
 class Reminder(Base):
     """Time-based prompts fired to the owner via the active messaging interface.
     Polled every 30s by ReminderService; no APScheduler persistence complexity."""

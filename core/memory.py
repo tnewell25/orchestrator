@@ -47,16 +47,18 @@ class MemoryStore:
         logger.info("Embedding model loaded")
 
     async def initialize(self):
-        """Create all tables + enable pgvector extension + add embedding column."""
+        """Create all tables + enable pgvector extension + add embedding columns."""
         async with self.engine.begin() as conn:
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(
-                text(
-                    f"ALTER TABLE semantic_memories "
-                    f"ADD COLUMN IF NOT EXISTS embedding vector({self.embedding_dim})"
+            # Vector-searchable tables
+            for tbl in ("semantic_memories", "battle_cards", "proposal_precedents"):
+                await conn.execute(
+                    text(
+                        f"ALTER TABLE {tbl} "
+                        f"ADD COLUMN IF NOT EXISTS embedding vector({self.embedding_dim})"
+                    )
                 )
-            )
 
     # -- Conversations --
 
@@ -219,6 +221,51 @@ class MemoryStore:
                 }
                 for r in result.fetchall()
             ]
+
+    # -- Generic vector helpers (reused by battle_cards, proposal_precedents) --
+
+    async def store_vector(self, table: str, row_id: str, content: str):
+        """Compute + save embedding for an existing row with a 'embedding vector(N)' column."""
+        embedding = await self._embed(content)
+        async with self.session_maker() as session:
+            await session.execute(
+                text(f"UPDATE {table} SET embedding = CAST(:e AS vector) WHERE id = :id"),
+                {"e": str(embedding), "id": row_id},
+            )
+            await session.commit()
+
+    async def search_vector(
+        self,
+        table: str,
+        text_col: str,
+        query: str,
+        limit: int = 5,
+        extra_cols: list[str] | None = None,
+        min_similarity: float = 0.25,
+    ) -> list[dict]:
+        """Semantic search over an arbitrary vector-enabled table."""
+        embedding = await self._embed(query)
+        cols = ["id", text_col] + (extra_cols or [])
+        col_sql = ", ".join(cols)
+        async with self.session_maker() as session:
+            result = await session.execute(
+                text(
+                    f"SELECT {col_sql}, "
+                    f"  1 - (embedding <=> CAST(:e AS vector)) AS similarity "
+                    f"FROM {table} "
+                    f"WHERE embedding IS NOT NULL "
+                    f"  AND 1 - (embedding <=> CAST(:e AS vector)) > :min_sim "
+                    f"ORDER BY embedding <=> CAST(:e AS vector) "
+                    f"LIMIT :limit"
+                ),
+                {"e": str(embedding), "min_sim": min_similarity, "limit": limit},
+            )
+            rows = []
+            for r in result.fetchall():
+                row = {c: r[i] for i, c in enumerate(cols)}
+                row["similarity"] = round(r[len(cols)], 3)
+                rows.append(row)
+            return rows
 
     async def close(self):
         await self.engine.dispose()

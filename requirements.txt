@@ -25,6 +25,8 @@ apscheduler>=3.10.0
 # Google (Gmail + Calendar)
 google-api-python-client>=2.111.0
 google-auth>=2.25.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
 
 # Voice transcription (Whisper via OpenAI)
 openai>=1.30.0
@@ -32,3 +34,6 @@ openai>=1.30.0
 # Natural-language date parsing for reminders ("in 2 hours", "tomorrow 3pm")
 python-dateutil>=2.8.2
 dateparser>=1.2.0
+
+# Web research (ResearchSkill)
+beautifulsoup4>=4.12.0

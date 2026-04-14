@@ -9,18 +9,30 @@ from pydantic import BaseModel
 from .config import get_settings
 from .core.agent import Agent
 from .core.audit import AuditLogger
+from .core.calendar_sync import CalendarAutoSync
 from .core.memory import MemoryStore
+from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
 from .core.token_manager import TokenManager
 from .interfaces.telegram_bot import TelegramBot
 from .skills.bid_skill import BidSkill
 from .skills.briefing_skill import BriefingSkill
+from .skills.calendar_skill import CalendarSkill
 from .skills.company_skill import CompanySkill
+from .skills.competitor_skill import CompetitorSkill
 from .skills.contact_skill import ContactSkill
+from .skills.deal_health_skill import DealHealthSkill
 from .skills.deal_skill import DealSkill
+from .skills.email_triage_skill import EmailTriageSkill
+from .skills.gmail_skill import GmailSkill
+from .skills.job_skill import JobSkill
 from .skills.meeting_skill import MeetingSkill
+from .skills.proposal_skill import ProposalSkill
 from .skills.reminder_skill import ReminderSkill
+from .skills.research_skill import ResearchSkill
+from .skills.stakeholder_skill import StakeholderSkill
 from .skills.task_skill import TaskSkill
+from .skills.weekly_review_skill import WeeklyReviewSkill
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +48,8 @@ token_manager: TokenManager | None = None
 audit_logger: AuditLogger | None = None
 telegram_bot: TelegramBot | None = None
 reminder_service: ReminderService | None = None
+calendar_sync: CalendarAutoSync | None = None
+proactive_monitor: ProactiveMonitor | None = None
 bot_task: asyncio.Task | None = None
 
 
@@ -68,17 +82,35 @@ async def lifespan(app: FastAPI):
         str(settings.allowed_user_ids[0]) if settings.allowed_user_ids else ""
     )
 
-    # 4. Skills — CRM domain + productivity
+    # 4. Skills — CRM + productivity + field ops + intelligence
     sm = memory.session_maker
+    gmail_skill = GmailSkill(settings.google_credentials_path)
+    calendar_skill = CalendarSkill(settings.google_credentials_path)
+
     skills = [
+        # CRM core
         CompanySkill(sm),
         ContactSkill(sm),
         DealSkill(sm),
         TaskSkill(sm),
         MeetingSkill(sm),
         BidSkill(sm, default_chat_id=default_chat_id),
+        # Productivity
         ReminderSkill(sm, default_chat_id=default_chat_id),
         BriefingSkill(sm),
+        WeeklyReviewSkill(sm),
+        # Pipeline intelligence
+        StakeholderSkill(sm),
+        DealHealthSkill(sm),
+        CompetitorSkill(sm, memory),
+        ProposalSkill(sm, memory),
+        # External
+        ResearchSkill(settings.serper_api_key),
+        gmail_skill,
+        calendar_skill,
+        EmailTriageSkill(sm, gmail_skill=gmail_skill),
+        # Field ops (v2 direction — slotted in)
+        JobSkill(sm),
     ]
     for s in skills:
         await s.setup()
@@ -100,13 +132,25 @@ async def lifespan(app: FastAPI):
     else:
         logger.warning("No TELEGRAM_BOT_TOKEN — bot not started")
 
-    # 7. Reminder service — polls DB, delivers via telegram bot, enriches via agent
+    # 7. Background services
     reminder_service = ReminderService(sm, telegram_bot, agent=agent)
     await reminder_service.start()
 
+    calendar_sync = CalendarAutoSync(
+        sm, calendar_skill, default_chat_id=default_chat_id
+    )
+    await calendar_sync.start()
+
+    proactive_monitor = ProactiveMonitor(sm, default_chat_id, settings)
+    await proactive_monitor.start()
+
     yield
 
-    # Shutdown
+    # Shutdown — reverse order
+    if proactive_monitor:
+        await proactive_monitor.stop()
+    if calendar_sync:
+        await calendar_sync.stop()
     if reminder_service:
         await reminder_service.stop()
     if telegram_bot:
