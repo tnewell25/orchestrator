@@ -10,6 +10,7 @@ import anthropic
 from .constants import EntityType
 from .graph import EntityRef
 from .planner import Intent, Plan
+from .prompt_assembler import PromptAssembler, build_daily_context_lines
 from .tool_registry import DEFAULT_ESSENTIALS, ToolRegistry, tool_search_schema
 
 if TYPE_CHECKING:
@@ -23,113 +24,6 @@ logger = logging.getLogger(__name__)
 ITER_DELAY_S = 0.25
 # How many times we catch a RateLimitError ourselves (on TOP of SDK's retries).
 RATE_LIMIT_RETRIES = 3
-
-STATIC_SYSTEM_PROMPT = """You are {agent_name}, the user's AI chief of staff.
-
-The user is a senior sales engineer selling industrial/enterprise solutions to
-large firms (Bosch, Honeywell, GE, Rockwell, Siemens, Emerson, etc). Sales
-cycles are long (9-18 months). Every ball dropped loses a 6-7 figure deal.
-
-Your mission: capture everything the user tells you, keep their pipeline and
-commitments organized, and act proactively so they never forget a detail.
-
-CORE RULES
-- Be concise — responses are read on a phone between meetings.
-- Lead with the result ("Logged meeting, reminder set for Fri 2pm") not process.
-- For multi-step requests, do ALL steps — never ask permission mid-task.
-- Use tools freely. Every fact the user mentions should be filed somewhere.
-
-WHAT TO CAPTURE (always)
-- Meetings → meeting-log (summary, attendees, decisions, transcript)
-- Commitments the user makes ("I'll send X by Friday") → task-create with due_date
-- Commitments the OTHER side makes → task-create, source='meeting', note who owes what
-- Personal details about contacts (kids, hobbies, hometown, recent promotion) →
-  contact-update personal_notes. These are gold for relationship building.
-- Competitor mentions → deal-update competitors
-- MEDDIC signals:
-  * Metrics the buyer cares about ("reduce downtime 15%") → deal-set_meddic_field metrics
-  * Economic buyer identified → deal-set_stakeholders economic_buyer_id
-  * Champion identified → deal-set_stakeholders champion_id
-  * Pain being solved → deal-set_meddic_field pain
-  * Decision criteria → deal-set_meddic_field decision_criteria
-  * Decision/paper process (security review, procurement steps) → deal-set_meddic_field
-- Bid/RFP mentioned with a deadline → bid-create (auto-schedules T-7d/T-3d/T-1d pings)
-
-PROACTIVE BEHAVIOR
-- When the user schedules a meeting, offer to set a pre-meeting brief reminder
-  (reminder-set_pre_meeting, default 30 min before). Do it without asking if
-  the meeting is with a known contact and there's context to surface.
-- When the user commits to something, set a reminder a day or two before the
-  due date (reminder-set, kind='commitment').
-- On any deal-get_context response, check meddic.gaps — if any critical fields
-  are missing, flag them in a single line: "Note: economic buyer and decision
-  process still unknown. Worth asking Markus next call?"
-- Before a meeting, surface personal_notes on the attendee — "Markus's son
-  started at MIT this year" — as conversation ammo.
-
-WHEN THE USER ASKS "WHAT'S GOING ON WITH X"
-1. company-find or deal-find to locate it
-2. deal-get_context for full picture
-3. Respond with: stage, value, next step, last meeting summary, open actions,
-   MEDDIC gaps. Keep to 6-10 bullets.
-
-REMINDERS
-- The user can say "remind me in 2 hours to call Markus" or "ping me tomorrow
-  9am about the spec" — use reminder-set with natural-language time.
-- For anything meeting-related, prefer reminder-set_pre_meeting so the brief
-  auto-generates.
-- Calendar events with known contacts already get auto-scheduled pre-meeting
-  briefs via the background sync — don't duplicate.
-
-INBOX
-- When the user asks about email, call emailtriage-rank_unread to get
-  importance-scored list, not gmail-list_unread raw.
-- When the agent drafts outbound email via gmail-send or gmail-create_draft,
-  ALSO call emailtriage-track_sent so the no-reply nudger can engage.
-
-DEAL INTELLIGENCE
-- For "how's Bosch going?" → deal-get_context (MEDDIC + meetings + actions +
-  bids) AND stakeholder-coverage (the 5-role map) AND dealhealth-score (temp).
-- Stalled deals and overdue commitments are pinged proactively by the
-  ProactiveMonitor background service — the user gets reminders without asking.
-
-RESEARCH
-- For "research Honeywell Forge" or "tell me about Anja Weber" → research-
-  company_deepdive / research-exec_bio / research-competitive_analysis. Synthesize
-  results into a tight 5-10 bullet brief. Don't paste raw search results.
-
-PROPOSALS
-- "Draft a proposal for Bosch" → proposal-draft_proposal with deal_id. Returns
-  markdown — paste it back for user to review and edit.
-- "Save this as precedent" → proposal-save_precedent so future drafts pull it.
-
-COMPETITORS
-- When user mentions a competitor by name → competitor-find_battle_card first
-  (semantic search for the situation) before synthesizing a response.
-- After a deal closes → competitor-log_win_loss for pattern mining.
-
-NEVER
-- Invent data. If you don't know, say so or look it up via research-search.
-- Ask permission to log something the user already told you.
-- Output lists with more than 10 items on mobile — summarize and offer drill-down."""
-
-
-def _build_dynamic_context(facts: list, memories: list, plan_hint: str = "") -> str:
-    """Facts + memories + plan hint change per-request — kept separate so the
-    static prompt (above) + tools can be cache_controlled for 10x TPM savings."""
-    parts = []
-    if plan_hint:
-        parts.append("PLANNER HINT (suggested but not binding):\n" + plan_hint)
-    if facts:
-        parts.append("Known facts:\n" + "\n".join(
-            f"- [{f['category']}] {f['key']}: {f['value']}" for f in facts
-        ))
-    if memories:
-        parts.append("Relevant memories:\n" + "\n".join(
-            f"- {m['content']}" for m in memories
-        ))
-    return "\n\n".join(parts) if parts else ""
-
 
 class Agent:
     def __init__(
@@ -157,6 +51,9 @@ class Agent:
         # the agent must call tool-search to discover others. Saves prompt tokens.
         self.lazy_tools = lazy_tools
         self.essentials = tuple(essentials)
+        self.prompt_assembler = PromptAssembler(agent_name=settings.agent_name)
+        # Daily context cache — recomputed at most once per (date, session_maker).
+        self._daily_cache: dict[str, tuple] = {}
 
         self._init_client()
 
@@ -217,17 +114,6 @@ class Agent:
 
         return out
 
-    def _build_system(self, static: str, dynamic: str) -> list:
-        """System prompt as content-block list: static part is cached (marked
-        with cache_control), dynamic per-call facts/memories append fresh.
-        Cache hit = ~10% of normal input cost for the cached prefix + tools."""
-        blocks = [
-            {"type": "text", "text": static, "cache_control": {"type": "ephemeral"}}
-        ]
-        if dynamic:
-            blocks.append({"type": "text", "text": dynamic})
-        return blocks
-
     def _init_client(self):
         # max_retries=5 so the SDK's built-in exponential backoff has more room
         # (default is 2, which gives up in ~1.2s — way too eager for OAuth bursts).
@@ -279,12 +165,26 @@ class Agent:
 
         memories = await self.memory.recall(message, limit=5, focus_ref=focus_ref)
 
-        static_system = STATIC_SYSTEM_PROMPT.format(
-            agent_name=self.settings.agent_name
+        # Pull a focus subgraph so block D shows the relationship picture.
+        focus_subgraph = None
+        if focus_ref is not None and getattr(self.memory, "_graph", None) is not None:
+            try:
+                focus_subgraph = await self.memory._graph.subgraph(
+                    focus_ref, max_depth=2, max_nodes=20,
+                )
+            except Exception as e:
+                logger.warning("Focus subgraph fetch failed: %s", e)
+
+        daily_lines = await self._get_daily_context()
+
+        assembled = self.prompt_assembler.assemble(
+            facts=facts,
+            memories=memories,
+            plan=plan,
+            focus_subgraph=focus_subgraph,
+            daily_context_lines=daily_lines,
         )
-        dynamic_system = _build_dynamic_context(
-            facts, memories, plan_hint=plan.to_prompt_hint() if plan.intent != Intent.AMBIGUOUS else "",
-        )
+        system_blocks = assembled.to_anthropic_blocks()
 
         messages = []
         for msg in conversation:
@@ -311,7 +211,7 @@ class Agent:
                     response = await self.client.messages.create(
                         model=model,
                         max_tokens=4096,
-                        system=self._build_system(static_system, dynamic_system),
+                        system=system_blocks,
                         tools=self._cache_controlled_tools(active_tools) if active_tools else anthropic.NOT_GIVEN,
                         messages=messages,
                     )
@@ -421,6 +321,31 @@ class Agent:
         fallback = "Hit the tool loop limit. Tell me to continue if you want me to keep going."
         await self.memory.add_message(session_id, "assistant", fallback, interface)
         return fallback
+
+    async def _get_daily_context(self) -> list[str]:
+        """Return today's commitments/MEDDIC-gap lines, cached per-day.
+
+        Cached for ~1 hour rather than per-day so newly-created action items
+        and reminders surface without a long staleness gap. Stale cache means
+        Block C breakpoint stays warm across consecutive turns within the hour.
+        """
+        from datetime import datetime, timezone
+        if getattr(self.memory, "session_maker", None) is None:
+            return []
+        bucket = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H")
+        cached = self._daily_cache.get(bucket)
+        if cached is not None:
+            return cached
+        try:
+            lines = await build_daily_context_lines(self.memory.session_maker)
+        except Exception as e:
+            logger.warning("Daily context build failed: %s", e)
+            lines = []
+        # Trim cache to last 4 buckets to bound memory
+        self._daily_cache = {bucket: lines, **{
+            k: v for k, v in list(self._daily_cache.items())[-3:]
+        }}
+        return lines
 
     async def _run_planner(self, message: str, conversation: list[dict]) -> Plan:
         """Optional pre-pass — Haiku call to identify focus + intent.
