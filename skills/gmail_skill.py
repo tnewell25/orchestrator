@@ -18,7 +18,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-from ..core.skill_base import Skill, tool
+from ..core.skill_base import Safety, Skill, tool
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,8 @@ class GmailSkill(Skill):
 
     @tool(
         "Send an email immediately. Only use when the user has explicitly said "
-        "'send it' — otherwise prefer create_draft."
+        "'send it' — otherwise prefer create_draft.",
+        safety=Safety.APPROVE_EXTERNAL,
     )
     async def send(
         self,

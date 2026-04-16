@@ -10,11 +10,13 @@ from .config import get_settings
 from .core.agent import Agent
 from .core.audit import AuditLogger
 from .core.calendar_sync import CalendarAutoSync
+from .core.action_gate import ActionGate
 from .core.compactor import Compactor
 from .core.entity_extractor import EntityExtractor
 from .core.events import EventBus
 from .core.graph import GraphStore
 from .core.memory import MemoryStore
+from .core.pipeline_watcher import PipelineWatcher
 from .core.planner import Planner
 from .core.rule_engine import ActionDispatcher, RuleEngine
 from .core.scheduler_tick import SchedulerTick
@@ -174,6 +176,7 @@ async def lifespan(app: FastAPI):
         Compactor(memory.session_maker, extractor_client, fast_model=settings.fast_model)
         if extractor_client else None
     )
+    action_gate = ActionGate(memory.session_maker)
     agent = Agent(
         memory=memory,
         skills=skills,
@@ -184,7 +187,9 @@ async def lifespan(app: FastAPI):
         entity_extractor=extractor,
         lazy_tools=True,
         compactor=compactor,
+        action_gate=action_gate,
     )
+    app.state.action_gate = action_gate
     logger.info(
         "Agent initialized — full catalog %d tools, lazy mode on (planner=%s)",
         len(agent.tools), bool(planner),
@@ -203,6 +208,16 @@ async def lifespan(app: FastAPI):
     # safer to use mutual TLS or a JWT verifier in front of this.
     app.include_router(build_webhook_router(event_bus))
     logger.info("EventBus + rule engine ready, webhooks mounted at /webhooks")
+
+    # 5c. Pipeline Watcher sub-agent — runs nightly via DAILY_SWEEP.
+    if extractor_client is not None:
+        watcher = PipelineWatcher(
+            sm, extractor_client, dispatcher,
+            fast_model=settings.fast_model, default_chat_id=default_chat_id,
+        )
+        watcher.attach_to_bus(event_bus)
+        app.state.pipeline_watcher = watcher
+        logger.info("PipelineWatcher attached to DAILY_SWEEP")
 
     # 6. Telegram bot (optional — fail soft)
     if settings.telegram_bot_token:
@@ -323,3 +338,58 @@ async def chat(body: Prompt):
         body.message, session_id=body.session_id, interface="http"
     )
     return {"response": response}
+
+
+# ---- Pending action approval API --------------------------------------
+
+
+@app.get("/pending-actions")
+async def list_pending_actions(session_id: str = ""):
+    gate = getattr(app.state, "action_gate", None)
+    if gate is None:
+        raise HTTPException(503, "action gate not initialized")
+    rows = await gate.list_pending(session_id=session_id)
+    return {
+        "items": [
+            {
+                "id": r.id, "session_id": r.session_id, "tool_name": r.tool_name,
+                "summary": r.summary, "created_at": str(r.created_at),
+                "expires_at": str(r.expires_at) if r.expires_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/pending-actions/{action_id}/approve")
+async def approve_pending_action(action_id: str):
+    gate = getattr(app.state, "action_gate", None)
+    if gate is None or agent is None:
+        raise HTTPException(503, "not ready")
+    approved = await gate.approve(action_id)
+    if approved is None:
+        raise HTTPException(404, "action not found, already decided, or expired")
+
+    # Execute the underlying tool now.
+    import json as _json
+    tool_input = _json.loads(approved.tool_input or "{}")
+    try:
+        result = await agent._execute_tool_bypass_gate(
+            approved.tool_name, tool_input, session_id=approved.session_id,
+        )
+        await gate.mark_executed(action_id, str(result)[:500])
+        return {"ok": True, "result": result}
+    except Exception as e:
+        await gate.mark_failed(action_id, str(e))
+        raise HTTPException(500, f"execution failed: {e}")
+
+
+@app.post("/pending-actions/{action_id}/reject")
+async def reject_pending_action(action_id: str):
+    gate = getattr(app.state, "action_gate", None)
+    if gate is None:
+        raise HTTPException(503, "action gate not initialized")
+    rejected = await gate.reject(action_id)
+    if rejected is None:
+        raise HTTPException(404, "action not found or already decided")
+    return {"ok": True, "id": action_id}

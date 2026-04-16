@@ -46,6 +46,7 @@ def _build_agent_with_skill(skill):
     agent.max_iterations = 5
     agent.planner = None
     agent.entity_extractor = None
+    agent.action_gate = None
     agent.tools = []
     agent.tool_map = {}
     for sch in skill.get_tools():

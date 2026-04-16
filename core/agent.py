@@ -8,11 +8,13 @@ from typing import TYPE_CHECKING, AsyncIterator
 
 import anthropic
 
+from .action_gate import ActionGate
 from .compactor import Compactor
 from .constants import EntityType
 from .graph import EntityRef
 from .planner import Intent, Plan
 from .prompt_assembler import PromptAssembler, build_daily_context_lines
+from .skill_base import Safety
 from .tool_registry import DEFAULT_ESSENTIALS, ToolRegistry, tool_search_schema
 
 if TYPE_CHECKING:
@@ -57,6 +59,7 @@ class Agent:
         lazy_tools: bool = False,
         essentials: tuple[str, ...] = DEFAULT_ESSENTIALS,
         compactor: "Compactor | None" = None,
+        action_gate: "ActionGate | None" = None,
     ):
         self.memory = memory
         self.skills = {s.name: s for s in skills}
@@ -76,6 +79,9 @@ class Agent:
         # Optional — when present, run() fires it asynchronously after each turn
         # so the next turn sees a smaller context window.
         self.compactor = compactor
+        # When present, approve_external tools are queued for user approval
+        # instead of executing immediately. The agent gets a "queued" result.
+        self.action_gate = action_gate
 
         self._init_client()
 
@@ -656,8 +662,17 @@ class Agent:
                     return ref
         return None
 
-    async def _execute_tool(
+    async def _execute_tool_bypass_gate(
         self, tool_name: str, tool_input: dict, session_id: str = ""
+    ) -> str:
+        """Run a tool without ActionGate interception. Used by the pending-action
+        approver to execute a previously-queued external action."""
+        return await self._execute_tool(
+            tool_name, tool_input, session_id=session_id, _bypass_gate=True,
+        )
+
+    async def _execute_tool(
+        self, tool_name: str, tool_input: dict, session_id: str = "", _bypass_gate: bool = False,
     ) -> str:
         skill = self.tool_map.get(tool_name)
         if not skill:
@@ -666,6 +681,21 @@ class Agent:
         method = skill.get_tool_method(tool_name)
         if not method:
             return f"Error: method not found for '{tool_name}'"
+
+        # Approve-external safety gate — queue instead of executing.
+        # Audit logger sees the call regardless (safety field captures intent).
+        safety = skill.get_tool_safety(tool_name) if hasattr(skill, "get_tool_safety") else Safety.AUTO
+        if self.action_gate is not None and safety == Safety.APPROVE_EXTERNAL and not _bypass_gate:
+            queued = await self.action_gate.intercept(
+                session_id=session_id, tool_name=tool_name, tool_input=tool_input,
+            )
+            if self.audit_logger:
+                await self.audit_logger.log(
+                    tool_name=tool_name, args=tool_input,
+                    result_status="queued", result_summary=queued.get("summary", "")[:200],
+                    session_id=session_id, duration_ms=0,
+                )
+            return json.dumps(queued)
 
         t0 = time.perf_counter()
         try:

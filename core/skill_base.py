@@ -7,10 +7,21 @@ import inspect
 import typing
 
 
-def tool(description: str = ""):
+# Safety categories drive whether an action runs immediately or needs user approval.
+#   auto             — read-only or local-only (CRM lookups, queries)
+#   confirm          — local writes the user can undo (deal-update, contact-create)
+#   approve_external — externally visible (gmail-send, calendar-create_event)
+class Safety:
+    AUTO = "auto"
+    CONFIRM = "confirm"
+    APPROVE_EXTERNAL = "approve_external"
+
+
+def tool(description: str = "", safety: str = Safety.AUTO):
     def decorator(func):
         func._is_tool = True
         func._tool_description = description or func.__doc__ or ""
+        func._tool_safety = safety
         return func
 
     return decorator
@@ -44,6 +55,12 @@ class Skill:
         if method and getattr(method, "_is_tool", False):
             return method
         return None
+
+    def get_tool_safety(self, tool_name: str) -> str:
+        m = self.get_tool_method(tool_name)
+        if m is None:
+            return Safety.AUTO
+        return getattr(m, "_tool_safety", Safety.AUTO)
 
     def _build_schema(self, method_name: str, method) -> dict:
         sig = inspect.signature(method)

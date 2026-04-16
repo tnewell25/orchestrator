@@ -110,6 +110,34 @@ class AuditLog(Base):
     result_summary = Column(String(500), nullable=False, default="")
     session_id = Column(String, nullable=False, default="")
     duration_ms = Column(Integer, nullable=False, default=0)
+    safety = Column(String, default="auto")  # auto | confirm | approve_external
+
+
+class PendingAction(Base):
+    """Externally-visible actions queued for user approval before execution.
+
+    The agent emits a tool_use for an approve_external tool; instead of running,
+    the agent writes a PendingAction row and tells the user via the active
+    interface (Telegram inline keyboard, web card, etc.). User taps Approve →
+    status flips to 'approved' → executor picks it up and runs the tool.
+    """
+
+    __tablename__ = "pending_actions"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    session_id = Column(String, nullable=False, index=True)
+    tool_name = Column(String, nullable=False)
+    tool_input = Column(Text, nullable=False)         # JSON-encoded args
+    summary = Column(Text, default="")                # human-readable preview
+    # status: pending | approved | rejected | executed | failed | expired
+    status = Column(String, default="pending", index=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    decided_at = Column(DateTime(timezone=True), nullable=True)
+    executed_at = Column(DateTime(timezone=True), nullable=True)
+    result_summary = Column(String(500), default="")
+    related_deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True)
+    related_contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
 
 class SemanticMemory(Base):

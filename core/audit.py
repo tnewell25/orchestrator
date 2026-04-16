@@ -19,6 +19,7 @@ class AuditLogger:
         result_summary: str,
         session_id: str = "",
         duration_ms: int = 0,
+        safety: str = "auto",
     ):
         try:
             args_str = json.dumps(args, default=str)[:500]
@@ -31,6 +32,7 @@ class AuditLogger:
                         result_summary=result_summary[:500],
                         session_id=session_id,
                         duration_ms=duration_ms,
+                        safety=safety,
                     )
                 )
                 await session.commit()

@@ -105,7 +105,8 @@ class CalendarSkill(Skill):
 
     @tool(
         "Create a calendar event. start and end in ISO format 'YYYY-MM-DDTHH:MM:SS' "
-        "(UTC assumed if no tz). attendee_emails is comma-separated."
+        "(UTC assumed if no tz). attendee_emails is comma-separated.",
+        safety="approve_external",
     )
     async def create_event(
         self,

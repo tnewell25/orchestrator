@@ -101,6 +101,7 @@ def _build_agent(lazy: bool, essentials=None):
     agent.max_iterations = 5
     agent.planner = None
     agent.entity_extractor = None
+    agent.action_gate = None
     agent.lazy_tools = lazy
     agent.essentials = essentials or ("contact-find", "deal-find")
     agent.registry = ToolRegistry(skills)
