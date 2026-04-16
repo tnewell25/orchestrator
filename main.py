@@ -349,6 +349,152 @@ class Prompt(BaseModel):
     session_id: str = "http-default"
 
 
+# Approximate per-model pricing in USD per 1M tokens. Source: Anthropic's
+# public pricing page — update if rates change. The /usage endpoint is for
+# rough visibility; console.anthropic.com/usage is the authoritative bill.
+PRICING = {
+    "claude-sonnet-4-5-20250929": {
+        "input": 3.00, "output": 15.00,
+        "cache_read": 0.30, "cache_creation": 3.75,
+    },
+    "claude-sonnet-4-5": {  # alias
+        "input": 3.00, "output": 15.00,
+        "cache_read": 0.30, "cache_creation": 3.75,
+    },
+    "claude-haiku-4-5-20251001": {
+        "input": 1.00, "output": 5.00,
+        "cache_read": 0.10, "cache_creation": 1.25,
+    },
+    "claude-haiku-4-5": {
+        "input": 1.00, "output": 5.00,
+        "cache_read": 0.10, "cache_creation": 1.25,
+    },
+}
+_DEFAULT_PRICING = {"input": 3.00, "output": 15.00, "cache_read": 0.30, "cache_creation": 3.75}
+
+
+def _cost_for(model: str, tokens: dict) -> float:
+    p = PRICING.get(model, _DEFAULT_PRICING)
+    return (
+        tokens.get("input_tokens", 0) * p["input"] / 1_000_000
+        + tokens.get("output_tokens", 0) * p["output"] / 1_000_000
+        + tokens.get("cache_read_tokens", 0) * p["cache_read"] / 1_000_000
+        + tokens.get("cache_creation_tokens", 0) * p["cache_creation"] / 1_000_000
+    )
+
+
+@app.get("/usage")
+async def usage(hours: int = 24):
+    """Aggregated token + cost usage from AuditLog over a rolling window.
+
+    hours=24 (default): last 24 hours. Use hours=168 for a week, hours=0 for
+    all time. Cost is estimated using public pricing; authoritative source is
+    the Anthropic console.
+    """
+    if not memory:
+        raise HTTPException(503, "not ready")
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import select, func
+    from .db.models import AuditLog
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours) if hours > 0 else None
+
+    async with memory.session_maker() as s:
+        q = select(
+            AuditLog.model,
+            func.count().label("turns"),
+            func.sum(AuditLog.input_tokens).label("input_tokens"),
+            func.sum(AuditLog.output_tokens).label("output_tokens"),
+            func.sum(AuditLog.cache_read_tokens).label("cache_read_tokens"),
+            func.sum(AuditLog.cache_creation_tokens).label("cache_creation_tokens"),
+        ).where(AuditLog.tool_name == "_turn")
+        if cutoff:
+            q = q.where(AuditLog.timestamp >= cutoff)
+        q = q.group_by(AuditLog.model)
+
+        rows = (await s.execute(q)).all()
+
+    by_model: dict[str, dict] = {}
+    total_turns = 0
+    total_cost = 0.0
+    total_input = 0
+    total_cache_read = 0
+
+    for row in rows:
+        model = row.model or "(unknown)"
+        tokens = {
+            "input_tokens": int(row.input_tokens or 0),
+            "output_tokens": int(row.output_tokens or 0),
+            "cache_read_tokens": int(row.cache_read_tokens or 0),
+            "cache_creation_tokens": int(row.cache_creation_tokens or 0),
+        }
+        cost = _cost_for(model, tokens)
+        denom = tokens["input_tokens"] + tokens["cache_read_tokens"] + tokens["cache_creation_tokens"]
+        hit_ratio = (tokens["cache_read_tokens"] / denom) if denom else 0.0
+
+        by_model[model] = {
+            "turns": int(row.turns or 0),
+            **tokens,
+            "cache_hit_ratio": round(hit_ratio, 3),
+            "estimated_cost_usd": round(cost, 4),
+        }
+        total_turns += int(row.turns or 0)
+        total_cost += cost
+        total_input += tokens["input_tokens"]
+        total_cache_read += tokens["cache_read_tokens"]
+
+    # Cache savings: what the cache_read tokens would have cost at the full
+    # input rate, minus what they actually cost.
+    savings = 0.0
+    for model, data in by_model.items():
+        p = PRICING.get(model, _DEFAULT_PRICING)
+        savings += data["cache_read_tokens"] * (p["input"] - p["cache_read"]) / 1_000_000
+
+    return {
+        "window_hours": hours if hours > 0 else "all",
+        "total_turns": total_turns,
+        "total_estimated_cost_usd": round(total_cost, 4),
+        "cache_savings_vs_uncached_usd": round(savings, 4),
+        "by_model": by_model,
+        "note": "Authoritative billing: https://console.anthropic.com/usage",
+    }
+
+
+@app.get("/usage/recent")
+async def usage_recent(limit: int = 20):
+    """Raw per-turn rows, newest first. Useful for spot-checking what happened
+    in the last few interactions."""
+    if not memory:
+        raise HTTPException(503, "not ready")
+    from sqlalchemy import select
+    from .db.models import AuditLog
+
+    async with memory.session_maker() as s:
+        q = (
+            select(AuditLog)
+            .where(AuditLog.tool_name == "_turn")
+            .order_by(AuditLog.timestamp.desc())
+            .limit(limit)
+        )
+        rows = (await s.execute(q)).scalars().all()
+    return {
+        "items": [
+            {
+                "timestamp": str(r.timestamp),
+                "model": r.model,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "cache_read_tokens": r.cache_read_tokens,
+                "cache_creation_tokens": r.cache_creation_tokens,
+                "duration_ms": r.duration_ms,
+                "session_id": r.session_id,
+                "iteration": r.args_summary,
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.post("/chat")
 async def chat(body: Prompt):
     """HTTP entrypoint for testing without Telegram."""
