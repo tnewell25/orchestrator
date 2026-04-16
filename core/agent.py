@@ -3,8 +3,16 @@ import asyncio
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import anthropic
+
+from .constants import EntityType
+from .graph import EntityRef
+from .planner import Intent, Plan
+
+if TYPE_CHECKING:
+    from .planner import Planner
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +113,12 @@ NEVER
 - Output lists with more than 10 items on mobile — summarize and offer drill-down."""
 
 
-def _build_dynamic_context(facts: list, memories: list) -> str:
-    """Facts + memories change per-request — kept separate so the static prompt
-    (above) + tools can be cache_controlled for 10x TPM savings."""
+def _build_dynamic_context(facts: list, memories: list, plan_hint: str = "") -> str:
+    """Facts + memories + plan hint change per-request — kept separate so the
+    static prompt (above) + tools can be cache_controlled for 10x TPM savings."""
     parts = []
+    if plan_hint:
+        parts.append("PLANNER HINT (suggested but not binding):\n" + plan_hint)
     if facts:
         parts.append("Known facts:\n" + "\n".join(
             f"- [{f['category']}] {f['key']}: {f['value']}" for f in facts
@@ -129,6 +139,8 @@ class Agent:
         token_manager=None,
         audit_logger=None,
         max_iterations: int = 15,
+        planner: "Planner | None" = None,
+        entity_extractor=None,
     ):
         self.memory = memory
         self.skills = {s.name: s for s in skills}
@@ -136,6 +148,12 @@ class Agent:
         self.token_manager = token_manager
         self.audit_logger = audit_logger
         self.max_iterations = max_iterations
+        # Optional — when present, run() does a Haiku planner pass before the
+        # main loop to identify focus entity + intent. Falls back gracefully.
+        self.planner = planner
+        # Used by the planner's focus resolver to map names → refs without
+        # running another DB query.
+        self.entity_extractor = entity_extractor
 
         self._init_client()
 
@@ -211,12 +229,20 @@ class Agent:
 
         conversation = await self.memory.get_conversation(session_id, limit=30)
         facts = await self.memory.get_facts()
-        memories = await self.memory.recall(message, limit=5)
+
+        # Planner pass — identify focus entity + intent so recall_hybrid gets
+        # proximity boost and the system prompt knows what mode to surface.
+        plan = await self._run_planner(message, conversation)
+        focus_ref = plan.focus
+
+        memories = await self.memory.recall(message, limit=5, focus_ref=focus_ref)
 
         static_system = STATIC_SYSTEM_PROMPT.format(
             agent_name=self.settings.agent_name
         )
-        dynamic_system = _build_dynamic_context(facts, memories)
+        dynamic_system = _build_dynamic_context(
+            facts, memories, plan_hint=plan.to_prompt_hint() if plan.intent != Intent.AMBIGUOUS else "",
+        )
 
         messages = []
         for msg in conversation:
@@ -283,7 +309,7 @@ class Agent:
                 return final_text
 
             assistant_content = []
-            tool_results = []
+            tool_use_blocks = []
 
             for block in response.content:
                 if block.type == "text":
@@ -297,16 +323,32 @@ class Agent:
                             "input": block.input,
                         }
                     )
-                    result = await self._execute_tool(
-                        block.name, block.input, session_id=session_id
+                    tool_use_blocks.append(block)
+
+            # Parallel execution — Anthropic emits multiple tool_use blocks per
+            # turn for genuinely independent reads (e.g. deal-get + stakeholder-list).
+            # gather() also makes single-tool turns no slower.
+            if tool_use_blocks:
+                results = await asyncio.gather(
+                    *(
+                        self._execute_tool(b.name, b.input, session_id=session_id)
+                        for b in tool_use_blocks
+                    ),
+                    return_exceptions=True,
+                )
+                tool_results = []
+                for b, r in zip(tool_use_blocks, results):
+                    content = (
+                        f"Error executing {b.name}: {r}"
+                        if isinstance(r, Exception) else r
                     )
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        }
-                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": b.id,
+                        "content": content,
+                    })
+            else:
+                tool_results = []
 
             messages.append({"role": "assistant", "content": assistant_content})
             messages.append({"role": "user", "content": tool_results})
@@ -314,6 +356,52 @@ class Agent:
         fallback = "Hit the tool loop limit. Tell me to continue if you want me to keep going."
         await self.memory.add_message(session_id, "assistant", fallback, interface)
         return fallback
+
+    async def _run_planner(self, message: str, conversation: list[dict]) -> Plan:
+        """Optional pre-pass — Haiku call to identify focus + intent.
+
+        Returns Plan() (empty) if no planner attached or if the call fails.
+        Never blocks the main loop on its outcome."""
+        if not self.planner:
+            return Plan()
+        try:
+            recent = "\n".join(
+                f"{m['role']}: {m['content'][:140]}" for m in conversation[-4:]
+            )
+            entities_summary = ""
+            if self.entity_extractor is not None:
+                entities_summary = self.entity_extractor.index.known_names_summary(limit=80)
+            tool_names = [t["name"] for t in self.tools[:60]]  # cap to avoid prompt bloat
+            return await self.planner.plan(
+                user_message=message,
+                recent_summary=recent,
+                known_entities_summary=entities_summary,
+                available_tools=tool_names,
+                entity_resolver=self._resolve_entity_by_name,
+            )
+        except Exception as e:
+            logger.warning("Planner failed, continuing without plan: %s", e)
+            return Plan()
+
+    async def _resolve_entity_by_name(self, name: str, type_str: str) -> EntityRef | None:
+        """Map a planner-produced (name, type) to a concrete EntityRef.
+
+        Uses the entity_extractor's substring index for instant lookup.
+        Returns None if no confident match exists."""
+        if self.entity_extractor is None:
+            return None
+        # The index is keyed by lowercase name → list[EntityRef]
+        candidates = self.entity_extractor.index._name_to_refs.get(name.lower(), [])
+        for ref in candidates:
+            if ref.type == type_str:
+                return ref
+        # Fallback — first-name match (lookup_substring already adds first names)
+        if " " in name:
+            first = name.split(" ", 1)[0].lower()
+            for ref in self.entity_extractor.index._name_to_refs.get(first, []):
+                if ref.type == type_str:
+                    return ref
+        return None
 
     async def _execute_tool(
         self, tool_name: str, tool_input: dict, session_id: str = ""

@@ -13,6 +13,7 @@ from .core.calendar_sync import CalendarAutoSync
 from .core.entity_extractor import EntityExtractor
 from .core.graph import GraphStore
 from .core.memory import MemoryStore
+from .core.planner import Planner
 from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
 from .core.token_manager import TokenManager
@@ -161,15 +162,19 @@ async def lifespan(app: FastAPI):
     for s in skills:
         await s.setup()
 
-    # 5. Agent
+    # 5. Agent — with planner if we have an LLM client
+    planner = Planner(extractor_client, fast_model=settings.fast_model) if extractor_client else None
     agent = Agent(
         memory=memory,
         skills=skills,
         settings=settings,
         token_manager=token_manager,
         audit_logger=audit_logger,
+        planner=planner,
+        entity_extractor=extractor,
     )
-    logger.info("Agent initialized with %d tools", len(agent.tools))
+    logger.info("Agent initialized with %d tools (planner=%s)",
+                len(agent.tools), bool(planner))
 
     # 6. Telegram bot (optional — fail soft)
     if settings.telegram_bot_token:
