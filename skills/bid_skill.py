@@ -16,7 +16,7 @@ from ..db.models import Bid, Reminder
 _STAGES = {"evaluating", "in_progress", "submitted", "won", "lost", "withdrawn"}
 
 
-def _parse_dt(s: str) -> datetime | None:
+def _parse_dt(s: str, user_timezone: str = "UTC") -> datetime | None:
     if not s:
         return None
     dt = dateparser.parse(
@@ -24,7 +24,7 @@ def _parse_dt(s: str) -> datetime | None:
         settings={
             "PREFER_DATES_FROM": "future",
             "RETURN_AS_TIMEZONE_AWARE": True,
-            "TIMEZONE": "UTC",
+            "TIMEZONE": user_timezone,
             "TO_TIMEZONE": "UTC",
         },
     )
@@ -37,10 +37,11 @@ class BidSkill(Skill):
     name = "bid"
     description = "Manage RFP/bid deadlines with automatic countdown reminders."
 
-    def __init__(self, session_maker, default_chat_id: str = ""):
+    def __init__(self, session_maker, default_chat_id: str = "", user_timezone: str = "UTC"):
         super().__init__()
         self.session_maker = session_maker
         self.default_chat_id = default_chat_id
+        self.user_timezone = user_timezone
 
     async def _schedule_deadline_reminders(
         self,
@@ -88,10 +89,10 @@ class BidSkill(Skill):
         deliverables: str = "",
         notes: str = "",
     ) -> dict:
-        sub_dt = _parse_dt(submission_deadline)
+        sub_dt = _parse_dt(submission_deadline, self.user_timezone)
         if not sub_dt:
             return {"error": f"Could not parse submission_deadline '{submission_deadline}'"}
-        qa_dt = _parse_dt(qa_deadline) if qa_deadline else None
+        qa_dt = _parse_dt(qa_deadline, self.user_timezone) if qa_deadline else None
 
         async with self.session_maker() as s:
             b = Bid(
@@ -172,11 +173,11 @@ class BidSkill(Skill):
             if value_usd >= 0:
                 b.value_usd = value_usd
             if submission_deadline:
-                dt = _parse_dt(submission_deadline)
+                dt = _parse_dt(submission_deadline, self.user_timezone)
                 if dt:
                     b.submission_deadline = dt
             if qa_deadline:
-                dt = _parse_dt(qa_deadline)
+                dt = _parse_dt(qa_deadline, self.user_timezone)
                 if dt:
                     b.qa_deadline = dt
             if deliverables:

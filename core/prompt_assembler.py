@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 
@@ -131,11 +132,36 @@ class AssembledPrompt:
         return out
 
 
+def build_datetime_header(user_timezone: str = "UTC") -> str:
+    """A compact 'what day/time is it' preamble injected into Block C.
+
+    Without this the model infers date from training cutoff and gets it
+    wrong (often a year or more off), which cascades into wrong reminder
+    dates, wrong 'Friday' references, wrong proposal deadlines.
+    """
+    now_utc = datetime.now(timezone.utc)
+    lines = [
+        f"Current UTC: {now_utc.strftime('%Y-%m-%d %H:%M')} "
+        f"({now_utc.strftime('%A, week %V')})"
+    ]
+    try:
+        local = now_utc.astimezone(ZoneInfo(user_timezone))
+        if user_timezone != "UTC":
+            lines.append(
+                f"User local time ({user_timezone}): "
+                f"{local.strftime('%Y-%m-%d %H:%M %Z')}"
+            )
+    except (ZoneInfoNotFoundError, Exception):
+        pass
+    return "CURRENT DATE/TIME (use this — do NOT infer the date):\n" + "\n".join(lines)
+
+
 class PromptAssembler:
     """Builds an AssembledPrompt for one agent turn."""
 
-    def __init__(self, agent_name: str = "Orchestrator"):
+    def __init__(self, agent_name: str = "Orchestrator", user_timezone: str = "UTC"):
         self.agent_name = agent_name
+        self.user_timezone = user_timezone
         self._block_a_cached = BLOCK_A_TEMPLATE.format(agent_name=agent_name)
 
     def assemble(
@@ -192,8 +218,12 @@ class PromptAssembler:
         strategy_context: str = "",
     ) -> str:
         """Per-turn volatile context — focus, memories, mode hint, compacted
-        history, and (for STRATEGY intent) pre-synthesized lessons + relationships."""
+        history, current datetime anchor, and STRATEGY fan-out results."""
         parts: list[str] = []
+
+        # Datetime header ALWAYS first — without this Claude hallucinates dates
+        # and cascades the error through every date-sensitive tool call.
+        parts.append(build_datetime_header(self.user_timezone))
 
         if session_brief:
             parts.append("EARLIER CONVERSATION SUMMARY:\n" + session_brief)

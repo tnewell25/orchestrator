@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     stalled_deal_days: int = 14
     unanswered_email_days: int = 5
 
+    # User timezone — critical for correct date interpretation in the agent.
+    # Without this, Claude has no anchor and may hallucinate "it's January 2025"
+    # (training-cutoff behavior), and dateparser puts everything in UTC, so
+    # "9am" reminders fire at 4-5am local. Must be an IANA tz database name.
+    user_timezone: str = "UTC"
+
     @property
     def allowed_user_ids(self) -> list[int]:
         if not self.telegram_allowed_users:

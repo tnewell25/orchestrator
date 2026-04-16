@@ -11,7 +11,7 @@ prompt — so the user gets context, not just "reminder fired".
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -20,6 +20,12 @@ from ..db.models import Reminder
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 30
+
+# Reminders whose trigger_at is further in the past than this get marked
+# 'stale' and SKIPPED. Guards against the agent ever setting a wrong-year
+# reminder (training-cutoff hallucination) and spamming stale pings the
+# next time the service boots.
+STALE_CUTOFF = timedelta(hours=24)
 
 
 class ReminderService:
@@ -61,6 +67,7 @@ class ReminderService:
 
     async def _tick(self):
         now = datetime.now(timezone.utc)
+        stale_boundary = now - STALE_CUTOFF
         async with self.session_maker() as s:
             result = await s.execute(
                 select(Reminder)
@@ -71,6 +78,19 @@ class ReminderService:
             due = list(result.scalars().all())
 
             for r in due:
+                # Skip stale — agent probably set this with a wrong-year
+                # hallucination. Mark so we don't re-scan.
+                trig = r.trigger_at
+                if trig and trig.tzinfo is None:
+                    trig = trig.replace(tzinfo=timezone.utc)
+                if trig and trig < stale_boundary:
+                    logger.warning(
+                        "Reminder %s stale (trigger_at=%s, now=%s) — marking skipped",
+                        r.id, trig, now,
+                    )
+                    r.status = "stale"
+                    continue
+
                 try:
                     rendered = await self._render(r)
                     await self._deliver(r, rendered)

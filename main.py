@@ -141,6 +141,7 @@ async def lifespan(app: FastAPI):
     gmail_skill = GmailSkill(settings.google_credentials_path)
     calendar_skill = CalendarSkill(settings.google_credentials_path)
 
+    user_tz = getattr(settings, "user_timezone", "UTC")
     skills = [
         # CRM core
         CompanySkill(sm),
@@ -148,11 +149,11 @@ async def lifespan(app: FastAPI):
         DealSkill(sm),
         TaskSkill(sm),
         MeetingSkill(sm, memory=memory),
-        BidSkill(sm, default_chat_id=default_chat_id),
+        BidSkill(sm, default_chat_id=default_chat_id, user_timezone=user_tz),
         # Knowledge graph queries
         GraphSkill(sm, graph),
         # Productivity
-        ReminderSkill(sm, default_chat_id=default_chat_id),
+        ReminderSkill(sm, default_chat_id=default_chat_id, user_timezone=user_tz),
         BriefingSkill(sm),
         WeeklyReviewSkill(sm),
         # Pipeline intelligence

@@ -118,11 +118,15 @@ def test_block_d_renders_memories_with_source():
     assert "Anja loves rugby" in p.block_d
 
 
-def test_block_d_omits_when_ambiguous_with_no_data():
+def test_block_d_always_contains_datetime_anchor():
+    """Regression guard — even AMBIGUOUS intent with no data must include the
+    datetime header so the model knows what day it is."""
     asm = PromptAssembler()
     p = asm.assemble(facts=[], memories=[], plan=Plan(intent=Intent.AMBIGUOUS))
-    # No mode hint, no focus, no memories → empty block D
-    assert p.block_d == ""
+    assert "CURRENT DATE/TIME" in p.block_d
+    # But still shouldn't contain mode-hint / focus sections
+    assert "MODE:" not in p.block_d
+    assert "FOCUS:" not in p.block_d
 
 
 # ---- Anthropic block conversion + cache breakpoints ------------------
@@ -150,12 +154,17 @@ def test_to_anthropic_blocks_marks_cacheable_blocks_only():
     assert "cache_control" not in blocks[-1]
 
 
-def test_to_anthropic_blocks_omits_empty_blocks():
+def test_to_anthropic_blocks_omits_optional_blocks():
+    """With no facts or daily lines, B and C are skipped — but A and D
+    (datetime anchor) are always present."""
     asm = PromptAssembler()
     p = asm.assemble(facts=[], memories=[], plan=Plan(intent=Intent.AMBIGUOUS))
     blocks = p.to_anthropic_blocks()
-    # Only block A present
-    assert len(blocks) == 1
+    # A (cached) + D (volatile datetime header) — B and C omitted
+    assert len(blocks) == 2
+    assert "cache_control" in blocks[0]    # A cached
+    assert "cache_control" not in blocks[1] # D volatile
+    assert "CURRENT DATE/TIME" in blocks[1]["text"]
 
 
 # ---- Daily context builder -------------------------------------------

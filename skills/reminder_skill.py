@@ -17,8 +17,13 @@ from ..core.skill_base import Skill, tool
 from ..db.models import Meeting, Reminder
 
 
-def _parse_when(when: str) -> datetime | None:
-    """Parse natural-language time string to UTC datetime."""
+def _parse_when(when: str, user_timezone: str = "UTC") -> datetime | None:
+    """Parse natural-language time string to UTC datetime.
+
+    user_timezone is the INPUT timezone — "9am" from a user in America/New_York
+    parses as 9am ET, returned as UTC. Without this, "9am" was parsed as UTC
+    and the reminder fired 4-5 hours before the user expected it.
+    """
     if not when:
         return None
     dt = dateparser.parse(
@@ -26,7 +31,7 @@ def _parse_when(when: str) -> datetime | None:
         settings={
             "PREFER_DATES_FROM": "future",
             "RETURN_AS_TIMEZONE_AWARE": True,
-            "TIMEZONE": "UTC",
+            "TIMEZONE": user_timezone,
             "TO_TIMEZONE": "UTC",
         },
     )
@@ -39,10 +44,11 @@ class ReminderSkill(Skill):
     name = "reminder"
     description = "Set, list, cancel, and snooze proactive reminders."
 
-    def __init__(self, session_maker, default_chat_id: str = ""):
+    def __init__(self, session_maker, default_chat_id: str = "", user_timezone: str = "UTC"):
         super().__init__()
         self.session_maker = session_maker
         self.default_chat_id = default_chat_id
+        self.user_timezone = user_timezone
 
     @tool(
         "Set a reminder. `when` accepts natural language: 'in 2 hours', 'tomorrow 3pm', "
@@ -60,7 +66,7 @@ class ReminderSkill(Skill):
         bid_id: str = "",
         kind: str = "custom",
     ) -> dict:
-        trigger_at = _parse_when(when)
+        trigger_at = _parse_when(when, user_timezone=self.user_timezone)
         if not trigger_at:
             return {"error": f"Could not parse time '{when}'. Try 'in 2 hours' or 'tomorrow 3pm'."}
         if trigger_at <= datetime.now(timezone.utc):
@@ -163,7 +169,7 @@ class ReminderSkill(Skill):
 
     @tool("Snooze a reminder — reschedule to a new `when` (natural-language time).")
     async def snooze(self, reminder_id: str, when: str) -> dict:
-        new_trigger = _parse_when(when)
+        new_trigger = _parse_when(when, user_timezone=self.user_timezone)
         if not new_trigger:
             return {"error": f"Could not parse time '{when}'"}
         async with self.session_maker() as s:

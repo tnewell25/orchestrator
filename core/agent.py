@@ -88,7 +88,10 @@ class Agent:
         # the agent must call tool-search to discover others. Saves prompt tokens.
         self.lazy_tools = lazy_tools
         self.essentials = tuple(essentials)
-        self.prompt_assembler = PromptAssembler(agent_name=settings.agent_name)
+        self.prompt_assembler = PromptAssembler(
+            agent_name=settings.agent_name,
+            user_timezone=getattr(settings, "user_timezone", "UTC"),
+        )
         # Daily context cache — recomputed at most once per (date, session_maker).
         self._daily_cache: dict[str, tuple] = {}
         # Optional — when present, run() fires it asynchronously after each turn
@@ -802,6 +805,12 @@ class Agent:
         if not self.planner:
             return Plan()
         try:
+            # Prepend the datetime anchor so the planner reasons against the
+            # right date (else Haiku inherits the same cutoff-era confusion
+            # as the main agent).
+            from .prompt_assembler import build_datetime_header
+            tz = getattr(self.settings, "user_timezone", "UTC")
+            date_header = build_datetime_header(tz)
             recent = "\n".join(
                 f"{m['role']}: {m['content'][:140]}" for m in conversation[-4:]
             )
@@ -810,7 +819,7 @@ class Agent:
                 entities_summary = self.entity_extractor.index.known_names_summary(limit=80)
             tool_names = [t["name"] for t in self.tools[:60]]  # cap to avoid prompt bloat
             return await self.planner.plan(
-                user_message=message,
+                user_message=f"{date_header}\n\n{message}",
                 recent_summary=recent,
                 known_entities_summary=entities_summary,
                 available_tools=tool_names,
