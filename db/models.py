@@ -52,6 +52,26 @@ class Conversation(Base):
     compacted_into = Column(String, ForeignKey("session_briefs.id", ondelete="SET NULL"), nullable=True, index=True)
 
 
+class AuthorizedUser(Base):
+    """Runtime-managed allow-list for Telegram users.
+
+    Env var TELEGRAM_ALLOWED_USERS remains the root trust — owners listed
+    there can never be revoked through the bot. This table is for
+    owner-added collaborators (e.g. a partner or EA) who should be able
+    to talk to the bot without env-var gymnastics.
+    """
+
+    __tablename__ = "authorized_users"
+
+    telegram_user_id = Column(String, primary_key=True)
+    name = Column(String, default="")
+    role = Column(String, default="member")    # owner | member
+    added_by = Column(String, default="")      # telegram_user_id of adder
+    added_at = Column(DateTime(timezone=True), default=_now)
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+    active = Column(String, default="yes")     # "yes" | "no"
+
+
 class BackgroundJob(Base):
     """Durable queue for background work that must survive process restarts.
 

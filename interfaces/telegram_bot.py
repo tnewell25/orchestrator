@@ -39,9 +39,13 @@ def _smart_split(text: str, limit: int = 4096) -> list[str]:
 
 
 class TelegramBot:
-    def __init__(self, agent, settings):
+    def __init__(self, agent, settings, session_maker=None):
         self.agent = agent
         self.settings = settings
+        # Optional — when provided, _allowed() also checks the DB allow-list
+        # so owner can add collaborators via the auth-add_user skill without
+        # editing env vars. Env list remains the root trust (owners).
+        self.session_maker = session_maker
         self.app: Application | None = None
         self.sessions: dict[str, str] = {}
         self.owner_chat_id: int | None = None
@@ -53,9 +57,37 @@ class TelegramBot:
             self.sessions[key] = f"tg-{user_id}-{today}"
         return self.sessions[key]
 
-    def _allowed(self, user_id: int) -> bool:
-        ids = self.settings.allowed_user_ids
-        return not ids or user_id in ids
+    async def _allowed(self, user_id: int) -> bool:
+        env_ids = self.settings.allowed_user_ids
+        if env_ids and user_id in env_ids:
+            return True
+        if self.session_maker is None:
+            # No DB wired — open bot (env_ids empty) or locked to env only
+            return not env_ids
+        # DB allow-list (runtime-managed via AuthSkill)
+        try:
+            from sqlalchemy import select
+            from ..db.models import AuthorizedUser
+            async with self.session_maker() as s:
+                row = await s.get(AuthorizedUser, str(user_id))
+                return bool(row and row.active == "yes")
+        except Exception as e:
+            logger.warning("auth DB check failed, falling back to env-only: %s", e)
+            return not env_ids  # fail-soft: open if no env, closed if env list present
+
+    async def _deny(self, update: Update) -> None:
+        """Tell the user their Telegram ID so they can share it with the owner."""
+        uid = update.effective_user.id
+        name = (update.effective_user.full_name or "").strip()
+        msg = (
+            f"Not authorized. Ask the owner to add you with this ID:\n"
+            f"\n"
+            f"  {uid}  ({name})\n"
+        )
+        try:
+            await update.message.reply_text(msg)
+        except Exception:
+            pass
 
     async def start(self):
         self.app = (
@@ -101,8 +133,8 @@ class TelegramBot:
     # -- handlers --
 
     async def _cmd_start(self, update: Update, context):
-        if not self._allowed(update.effective_user.id):
-            await update.message.reply_text("Not authorized.")
+        if not await self._allowed(update.effective_user.id):
+            await self._deny(update)
             return
         self.owner_chat_id = update.effective_chat.id
         await update.message.reply_text(
@@ -115,7 +147,8 @@ class TelegramBot:
         )
 
     async def _cmd_new(self, update: Update, context):
-        if not self._allowed(update.effective_user.id):
+        if not await self._allowed(update.effective_user.id):
+            await self._deny(update)
             return
         uid = update.effective_user.id
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -124,7 +157,8 @@ class TelegramBot:
         await update.message.reply_text("Fresh session started.")
 
     async def _cmd_brief(self, update: Update, context):
-        if not self._allowed(update.effective_user.id):
+        if not await self._allowed(update.effective_user.id):
+            await self._deny(update)
             return
         await update.message.chat.send_action(ChatAction.TYPING)
         session_id = self._session_id(update.effective_user.id)
@@ -139,7 +173,8 @@ class TelegramBot:
 
     async def _on_text(self, update: Update, context):
         uid = update.effective_user.id
-        if not self._allowed(uid):
+        if not await self._allowed(uid):
+            await self._deny(update)
             return
         self.owner_chat_id = update.effective_chat.id
         session_id = self._session_id(uid)
@@ -155,7 +190,8 @@ class TelegramBot:
 
     async def _on_voice(self, update: Update, context):
         uid = update.effective_user.id
-        if not self._allowed(uid):
+        if not await self._allowed(uid):
+            await self._deny(update)
             return
         self.owner_chat_id = update.effective_chat.id
         session_id = self._session_id(uid)
@@ -220,7 +256,8 @@ class TelegramBot:
 
     async def _on_photo(self, update: Update, context):
         uid = update.effective_user.id
-        if not self._allowed(uid):
+        if not await self._allowed(uid):
+            await self._deny(update)
             return
         # v1: acknowledge only. Vision handling (business cards, whiteboards)
         # added in v1.1 — forward caption + placeholder to the agent.

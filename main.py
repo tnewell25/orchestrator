@@ -44,6 +44,7 @@ from .skills.proposal_skill import ProposalSkill
 from .skills.reminder_skill import ReminderSkill
 from .skills.research_skill import ResearchSkill
 from .skills.stakeholder_skill import StakeholderSkill
+from .skills.auth_skill import AuthSkill
 from .skills.task_skill import TaskSkill
 from .skills.usage_skill import UsageSkill
 from .skills.weekly_review_skill import WeeklyReviewSkill
@@ -158,6 +159,7 @@ async def lifespan(app: FastAPI):
         BriefingSkill(sm),
         WeeklyReviewSkill(sm),
         UsageSkill(sm),
+        AuthSkill(sm),
         # Pipeline intelligence
         StakeholderSkill(sm),
         DealHealthSkill(sm),
@@ -244,7 +246,7 @@ async def lifespan(app: FastAPI):
     # 6. Telegram bot (optional — fail soft)
     if settings.telegram_bot_token:
         try:
-            telegram_bot = TelegramBot(agent, settings)
+            telegram_bot = TelegramBot(agent, settings, session_maker=sm)
             await telegram_bot.start()
         except Exception as e:
             logger.exception("Telegram bot failed to start: %s", e)
