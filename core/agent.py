@@ -280,6 +280,13 @@ class Agent:
         recovered_this_run = False
         rl_retries_left = RATE_LIMIT_RETRIES
 
+        # Rewind tracking — detect when the agent re-calls a failing tool with
+        # the same args. Instead of appending yet another error to history, we
+        # DROP the prior failed exchange and inject a corrective note, so the
+        # next iteration doesn't see the failure in context. Saves 200-800
+        # tokens per loop and breaks infinite-retry patterns faster.
+        last_error_sigs: set[str] = set()
+
         for iteration in range(self.max_iterations):
             # Small cadence delay between iterations to avoid burst-triggering 429.
             # Skip on iteration 0 (don't add latency to user's first response).
@@ -413,6 +420,28 @@ class Agent:
                 # (Anthropic SDK is strict — out-of-order tool_use_ids fail).
                 order = {b.id: i for i, b in enumerate(tool_use_blocks)}
                 tool_results.sort(key=lambda r: order.get(r["tool_use_id"], 0))
+
+            # Rewind check — did the agent re-call a failing tool with the
+            # same args that failed last iteration?
+            error_sigs_this_turn = self._error_signatures(tool_use_blocks, tool_results)
+            repeated = error_sigs_this_turn & last_error_sigs
+            last_error_sigs = error_sigs_this_turn
+
+            if repeated and len(messages) >= 2:
+                # Drop the PREVIOUS failed (assistant, tool_result) pair so the
+                # API doesn't re-see the error. Replace this turn's pair with a
+                # corrective user note.
+                messages.pop()  # previous tool_result (user role)
+                messages.pop()  # previous assistant turn
+                lesson = (
+                    "Previous attempts failed with the same arguments: "
+                    + ", ".join(sorted(repeated))
+                    + ". Don't retry them verbatim — try a different tool, "
+                      "different arguments, or ask the user to clarify."
+                )
+                messages.append({"role": "user", "content": lesson})
+                logger.info("Rewound %d repeated tool failures: %s", len(repeated), repeated)
+                continue
 
             messages.append({"role": "assistant", "content": assistant_content})
             messages.append({"role": "user", "content": tool_results})
@@ -708,6 +737,32 @@ class Agent:
         except Exception as e:
             logger.warning("Planner failed, continuing without plan: %s", e)
             return Plan()
+
+    @staticmethod
+    def _error_signatures(tool_use_blocks, tool_results) -> set[str]:
+        """Build a set of stable signatures for tool calls whose result is an
+        error string. Signature = tool_name + hashed args, so a retry with
+        the same args is detectable in the next iteration."""
+        import hashlib
+        results_by_id = {r["tool_use_id"]: r for r in tool_results}
+        sigs: set[str] = set()
+        for b in tool_use_blocks:
+            r = results_by_id.get(b.id)
+            if not r:
+                continue
+            content = r.get("content", "")
+            is_error = isinstance(content, str) and (
+                content.startswith("Error executing") or content.startswith("Error:")
+            )
+            if not is_error:
+                continue
+            try:
+                args_str = json.dumps(b.input or {}, default=str, sort_keys=True)
+            except (TypeError, ValueError):
+                args_str = str(b.input)
+            sig_hash = hashlib.sha256(args_str.encode("utf-8")).hexdigest()[:10]
+            sigs.add(f"{b.name}({sig_hash})")
+        return sigs
 
     def _handle_tool_search(
         self, tool_input: dict, active_tools: list[dict], loaded: set[str]
