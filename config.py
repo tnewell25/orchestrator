@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     max_agent_iterations: int = 8
     conversation_window_limit: int = 15
 
+    # Cost alert thresholds — when crossed, the agent emits events that rules
+    # can react to (force compaction, downgrade model, etc.). 0 disables.
+    turn_input_token_threshold: int = 40000   # one API call shouldn't exceed this often
+    session_input_token_threshold: int = 500000  # cumulative session input tokens
+
     # Embeddings (local via fastembed)
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384

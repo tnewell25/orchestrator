@@ -53,6 +53,11 @@ class EventType:
     DEAL_STALLED = "deal.stalled"
     MEDDIC_GAP_FOUND = "meddic.gap_found"
 
+    # Cost-aware — fired by Agent when token usage crosses thresholds.
+    # Rules can react by forcing compaction, downgrading model, or notifying user.
+    TURN_COST_HIGH = "cost.turn_high"
+    SESSION_COST_EXCEEDED = "cost.session_exceeded"
+
 
 @dataclass
 class Event:

@@ -178,6 +178,17 @@ async def rule_email_received_triage(event: Event, sm: async_sessionmaker) -> li
     return [PublishEvent(type="email.triage_requested", payload=event.payload)]
 
 
+async def rule_compact_on_high_cost(event: Event, sm: async_sessionmaker) -> list[Action]:
+    """When session token budget is exceeded, chain a compaction request.
+
+    The actual compaction happens via the Compactor service; this rule is
+    the declarative link between 'we're getting expensive' and 'shrink the
+    active window.' Emits a compaction.requested event for any listener."""
+    if event.type != EventType.SESSION_COST_EXCEEDED:
+        return []
+    return [PublishEvent(type="compaction.requested", payload=event.payload)]
+
+
 # ---- Engine + dispatcher --------------------------------------------
 
 
@@ -225,6 +236,12 @@ class RuleEngine:
             event_types=(EventType.EMAIL_RECEIVED,),
             handler=rule_email_received_triage,
             description="Chain a triage event when new mail arrives",
+        ))
+        self.register(Rule(
+            name="compact_on_high_cost",
+            event_types=(EventType.SESSION_COST_EXCEEDED,),
+            handler=rule_compact_on_high_cost,
+            description="Request compaction when session cost budget exceeded",
         ))
 
     def _make_handler(self, rule: Rule):
@@ -298,4 +315,5 @@ __all__ = [
     "rule_no_reply_email",
     "rule_bid_deadline_t7d",
     "rule_email_received_triage",
+    "rule_compact_on_high_cost",
 ]

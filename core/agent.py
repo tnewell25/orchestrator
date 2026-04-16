@@ -11,6 +11,7 @@ import anthropic
 from .action_gate import ActionGate
 from .compactor import Compactor
 from .constants import EntityType
+from .events import EventBus, EventType
 from .graph import EntityRef
 from .planner import Intent, Plan
 from .prompt_assembler import PromptAssembler, build_daily_context_lines
@@ -60,6 +61,7 @@ class Agent:
         essentials: tuple[str, ...] = DEFAULT_ESSENTIALS,
         compactor: "Compactor | None" = None,
         action_gate: "ActionGate | None" = None,
+        event_bus: "EventBus | None" = None,
     ):
         self.memory = memory
         self.skills = {s.name: s for s in skills}
@@ -93,6 +95,12 @@ class Agent:
         # When present, approve_external tools are queued for user approval
         # instead of executing immediately. The agent gets a "queued" result.
         self.action_gate = action_gate
+        # When present, token thresholds publish TURN_COST_HIGH /
+        # SESSION_COST_EXCEEDED events rules can react to.
+        self.event_bus = event_bus
+        # Cumulative session input tokens. Cleared when SESSION_COST_EXCEEDED
+        # fires so we don't re-spam the event.
+        self._session_tokens: dict[str, int] = {}
 
         self._init_client()
 
@@ -351,6 +359,8 @@ class Agent:
                 except Exception:
                     pass
 
+            await self._maybe_emit_cost_alerts(session_id, response)
+
             if not any(b.type == "tool_use" for b in response.content):
                 final_text = "".join(
                     b.text for b in response.content if b.type == "text"
@@ -581,6 +591,8 @@ class Agent:
                     except Exception:
                         pass
 
+                await self._maybe_emit_cost_alerts(session_id, final_response)
+
                 if not any(b.type == "tool_use" for b in final_response.content):
                     final_text = accumulated_text or "".join(
                         b.text for b in final_response.content if b.type == "text"
@@ -651,6 +663,57 @@ class Agent:
 
         except Cancelled:
             yield StreamEvent(type="cancelled")
+
+    async def _maybe_emit_cost_alerts(self, session_id: str, response) -> None:
+        """Emit TURN_COST_HIGH / SESSION_COST_EXCEEDED when token usage crosses
+        configured thresholds. Rules can react (compact, downgrade, notify)."""
+        if self.event_bus is None:
+            return
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+
+        turn_input = int(getattr(usage, "input_tokens", 0) or 0) + \
+                     int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        turn_cached = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        turn_output = int(getattr(usage, "output_tokens", 0) or 0)
+
+        turn_threshold = int(getattr(self.settings, "turn_input_token_threshold", 0) or 0)
+        session_threshold = int(getattr(self.settings, "session_input_token_threshold", 0) or 0)
+
+        if turn_threshold > 0 and turn_input >= turn_threshold:
+            try:
+                await self.event_bus.publish(
+                    EventType.TURN_COST_HIGH,
+                    payload={
+                        "session_id": session_id,
+                        "input_tokens": turn_input,
+                        "cache_read_tokens": turn_cached,
+                        "output_tokens": turn_output,
+                        "threshold": turn_threshold,
+                    },
+                    source="agent",
+                )
+            except Exception as e:
+                logger.warning("TURN_COST_HIGH emit failed: %s", e)
+
+        if session_threshold > 0:
+            cumulative = self._session_tokens.get(session_id, 0) + turn_input
+            self._session_tokens[session_id] = cumulative
+            if cumulative >= session_threshold:
+                try:
+                    await self.event_bus.publish(
+                        EventType.SESSION_COST_EXCEEDED,
+                        payload={
+                            "session_id": session_id,
+                            "cumulative_input_tokens": cumulative,
+                            "threshold": session_threshold,
+                        },
+                        source="agent",
+                    )
+                finally:
+                    # Reset so the alert doesn't fire on every subsequent turn
+                    self._session_tokens[session_id] = 0
 
     def _schedule_compaction(self, session_id: str, plan: Plan | None = None) -> None:
         """Fire-and-forget compaction after a turn completes.

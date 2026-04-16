@@ -177,6 +177,8 @@ async def lifespan(app: FastAPI):
         if extractor_client else None
     )
     action_gate = ActionGate(memory.session_maker)
+    # Create event bus BEFORE agent so cost alerts can publish from the first turn.
+    event_bus = EventBus()
     agent = Agent(
         memory=memory,
         skills=skills,
@@ -188,6 +190,7 @@ async def lifespan(app: FastAPI):
         lazy_tools=True,
         compactor=compactor,
         action_gate=action_gate,
+        event_bus=event_bus,
     )
     app.state.action_gate = action_gate
     logger.info(
@@ -195,8 +198,8 @@ async def lifespan(app: FastAPI):
         len(agent.tools), bool(planner),
     )
 
-    # 5b. Event bus + rule engine — proactive logic moves from polling to events.
-    event_bus = EventBus()
+    # 5b. Rule engine — reuses the EventBus created above so cost alerts
+    # published from the agent feed into declarative rules.
     dispatcher = ActionDispatcher(sm, event_bus)
     rule_engine = RuleEngine(event_bus, sm, dispatcher)
     rule_engine.register_builtins()
