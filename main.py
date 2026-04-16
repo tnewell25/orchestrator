@@ -162,7 +162,8 @@ async def lifespan(app: FastAPI):
     for s in skills:
         await s.setup()
 
-    # 5. Agent — with planner if we have an LLM client
+    # 5. Agent — with planner if we have an LLM client; lazy tool loading
+    # so the always-loaded prompt prefix stays small and cache-stable.
     planner = Planner(extractor_client, fast_model=settings.fast_model) if extractor_client else None
     agent = Agent(
         memory=memory,
@@ -172,9 +173,12 @@ async def lifespan(app: FastAPI):
         audit_logger=audit_logger,
         planner=planner,
         entity_extractor=extractor,
+        lazy_tools=True,
     )
-    logger.info("Agent initialized with %d tools (planner=%s)",
-                len(agent.tools), bool(planner))
+    logger.info(
+        "Agent initialized — full catalog %d tools, lazy mode on (planner=%s)",
+        len(agent.tools), bool(planner),
+    )
 
     # 6. Telegram bot (optional — fail soft)
     if settings.telegram_bot_token:
