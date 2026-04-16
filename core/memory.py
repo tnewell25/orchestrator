@@ -21,6 +21,7 @@ from ..db.models import (
     Fact,
     OAuthToken,
     SemanticMemory,
+    SessionBrief,
 )
 from .constants import (
     GRAPH_PROXIMITY_BONUS,
@@ -167,16 +168,36 @@ class MemoryStore:
             await session.commit()
 
     async def get_conversation(self, session_id: str, limit: int = 30) -> list[dict]:
+        """Active (non-compacted) messages, oldest→newest."""
         async with self.session_maker() as session:
             result = await session.execute(
                 select(Conversation)
-                .where(Conversation.session_id == session_id)
+                .where(
+                    Conversation.session_id == session_id,
+                    Conversation.compacted_into.is_(None),
+                )
                 .order_by(Conversation.timestamp.desc())
                 .limit(limit)
             )
             rows = list(result.scalars().all())
             rows.reverse()
             return [{"role": r.role, "content": r.content} for r in rows]
+
+    async def get_latest_session_brief(self, session_id: str) -> str:
+        """Return the most-recent compaction summary for a session, or '' if none.
+
+        Injected into the system prompt so the agent retains context that has
+        scrolled out of the active window."""
+        async with self.session_maker() as session:
+            row = (
+                await session.execute(
+                    select(SessionBrief)
+                    .where(SessionBrief.session_id == session_id)
+                    .order_by(SessionBrief.until_timestamp.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            return row.summary if row else ""
 
     # -- Facts --
 

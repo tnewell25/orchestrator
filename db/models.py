@@ -46,6 +46,30 @@ class Conversation(Base):
     content = Column(Text, nullable=False)
     interface = Column(String, default="telegram")
     timestamp = Column(DateTime(timezone=True), default=_now)
+    # Set by compactor when this row's content is rolled into a SessionBrief.
+    # The agent excludes compacted rows from get_conversation; the brief is
+    # injected into the prompt instead. Kept for audit, not deleted.
+    compacted_into = Column(String, ForeignKey("session_briefs.id", ondelete="SET NULL"), nullable=True, index=True)
+
+
+class SessionBrief(Base):
+    """A summary of older conversation turns, replacing them in the active
+    window. Multiple briefs can exist per session; only the most recent
+    (largest until_timestamp) is injected into the prompt.
+
+    The compactor runs after a turn whenever the live conversation grows beyond
+    threshold — it summarizes the oldest N rows, marks them compacted_into=this
+    brief, and links until_timestamp to the boundary.
+    """
+
+    __tablename__ = "session_briefs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    session_id = Column(String, nullable=False, index=True)
+    summary = Column(Text, nullable=False)
+    until_timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
+    rows_compacted = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), default=_now)
 
 
 class Fact(Base):

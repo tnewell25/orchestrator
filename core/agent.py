@@ -3,10 +3,12 @@ import asyncio
 import json
 import logging
 import time
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, AsyncIterator
 
 import anthropic
 
+from .compactor import Compactor
 from .constants import EntityType
 from .graph import EntityRef
 from .planner import Intent, Plan
@@ -25,6 +27,22 @@ ITER_DELAY_S = 0.25
 # How many times we catch a RateLimitError ourselves (on TOP of SDK's retries).
 RATE_LIMIT_RETRIES = 3
 
+
+@dataclass
+class StreamEvent:
+    """Event yielded by Agent.run_stream — caller picks which to render."""
+    type: str           # 'text_delta' | 'tool_call' | 'tool_result' | 'complete' | 'error' | 'cancelled'
+    text: str = ""      # populated for text_delta and complete
+    tool_name: str = ""
+    tool_input: dict | None = None
+    tool_result: str = ""
+    error: str = ""
+
+
+class Cancelled(Exception):
+    """Raised inside the stream loop when a caller-supplied event is set."""
+
+
 class Agent:
     def __init__(
         self,
@@ -38,6 +56,7 @@ class Agent:
         entity_extractor=None,
         lazy_tools: bool = False,
         essentials: tuple[str, ...] = DEFAULT_ESSENTIALS,
+        compactor: "Compactor | None" = None,
     ):
         self.memory = memory
         self.skills = {s.name: s for s in skills}
@@ -54,6 +73,9 @@ class Agent:
         self.prompt_assembler = PromptAssembler(agent_name=settings.agent_name)
         # Daily context cache — recomputed at most once per (date, session_maker).
         self._daily_cache: dict[str, tuple] = {}
+        # Optional — when present, run() fires it asynchronously after each turn
+        # so the next turn sees a smaller context window.
+        self.compactor = compactor
 
         self._init_client()
 
@@ -165,6 +187,14 @@ class Agent:
 
         memories = await self.memory.recall(message, limit=5, focus_ref=focus_ref)
 
+        # Compaction summary — block D includes this so the agent retains context
+        # that's been rolled out of the active conversation window.
+        session_brief = ""
+        try:
+            session_brief = await self.memory.get_latest_session_brief(session_id)
+        except Exception as e:
+            logger.warning("Session brief fetch failed: %s", e)
+
         # Pull a focus subgraph so block D shows the relationship picture.
         focus_subgraph = None
         if focus_ref is not None and getattr(self.memory, "_graph", None) is not None:
@@ -183,6 +213,7 @@ class Agent:
             plan=plan,
             focus_subgraph=focus_subgraph,
             daily_context_lines=daily_lines,
+            session_brief=session_brief,
         )
         system_blocks = assembled.to_anthropic_blocks()
 
@@ -253,6 +284,7 @@ class Agent:
                 await self.memory.add_message(
                     session_id, "assistant", final_text, interface
                 )
+                self._schedule_compaction(session_id)
                 return final_text
 
             assistant_content = []
@@ -321,6 +353,210 @@ class Agent:
         fallback = "Hit the tool loop limit. Tell me to continue if you want me to keep going."
         await self.memory.add_message(session_id, "assistant", fallback, interface)
         return fallback
+
+    async def run_stream(
+        self,
+        message: str,
+        session_id: str,
+        interface: str = "telegram",
+        model: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Streaming variant of run() — yields incremental events.
+
+        Event types:
+          text_delta: a chunk of the user-visible response (most useful for UI)
+          tool_call:  agent decided to invoke a tool
+          tool_result: tool returned (compact summary)
+          complete:   final response text (also accumulated from deltas)
+          cancelled:  cancel_event was set
+          error:      unrecoverable error mid-stream
+
+        Pass cancel_event to allow interruption — if set between iterations or
+        between stream events, the agent stops cleanly without a partial commit.
+        """
+        model = model or self.settings.default_model
+        if self.token_manager:
+            await self.token_manager.ensure_token()
+            self._init_client()
+
+        await self.memory.add_message(session_id, "user", message, interface)
+
+        conversation = await self.memory.get_conversation(session_id, limit=30)
+        facts = await self.memory.get_facts()
+        plan = await self._run_planner(message, conversation)
+        focus_ref = plan.focus
+        memories = await self.memory.recall(message, limit=5, focus_ref=focus_ref)
+
+        session_brief = ""
+        try:
+            session_brief = await self.memory.get_latest_session_brief(session_id)
+        except Exception as e:
+            logger.warning("Session brief fetch failed: %s", e)
+
+        focus_subgraph = None
+        if focus_ref is not None and getattr(self.memory, "_graph", None) is not None:
+            try:
+                focus_subgraph = await self.memory._graph.subgraph(
+                    focus_ref, max_depth=2, max_nodes=20,
+                )
+            except Exception as e:
+                logger.warning("Focus subgraph fetch failed: %s", e)
+
+        daily_lines = await self._get_daily_context()
+
+        assembled = self.prompt_assembler.assemble(
+            facts=facts, memories=memories, plan=plan,
+            focus_subgraph=focus_subgraph,
+            daily_context_lines=daily_lines,
+            session_brief=session_brief,
+        )
+        system_blocks = assembled.to_anthropic_blocks()
+
+        messages = [
+            {"role": m["role"], "content": m["content"]}
+            for m in conversation if m["role"] in ("user", "assistant")
+        ]
+        active_tools = self._initial_active_tools(plan)
+        loaded_tool_names = {t["name"] for t in active_tools}
+
+        def _check_cancel():
+            if cancel_event is not None and cancel_event.is_set():
+                raise Cancelled()
+
+        try:
+            for iteration in range(self.max_iterations):
+                _check_cancel()
+                if iteration > 0:
+                    await asyncio.sleep(ITER_DELAY_S)
+
+                accumulated_text = ""
+                final_response = None
+                try:
+                    async with self.client.messages.stream(
+                        model=model,
+                        max_tokens=4096,
+                        system=system_blocks,
+                        tools=self._cache_controlled_tools(active_tools) if active_tools else anthropic.NOT_GIVEN,
+                        messages=messages,
+                    ) as stream:
+                        async for ev in stream:
+                            _check_cancel()
+                            # SDK >= 0.25 emits TextEvent / ContentBlockDeltaEvent
+                            if hasattr(ev, "type") and ev.type == "text":
+                                # Convenience event from the streaming helper
+                                accumulated_text += ev.text
+                                yield StreamEvent(type="text_delta", text=ev.text)
+                            elif hasattr(ev, "type") and ev.type == "content_block_delta":
+                                delta = getattr(ev, "delta", None)
+                                if delta is not None and getattr(delta, "type", "") == "text_delta":
+                                    accumulated_text += delta.text
+                                    yield StreamEvent(type="text_delta", text=delta.text)
+                        final_response = await stream.get_final_message()
+                except Cancelled:
+                    yield StreamEvent(type="cancelled")
+                    return
+                except Exception as e:
+                    logger.exception("Stream error on iteration %d", iteration)
+                    yield StreamEvent(type="error", error=str(e))
+                    return
+
+                if final_response is None:
+                    yield StreamEvent(type="error", error="empty stream response")
+                    return
+
+                if not any(b.type == "tool_use" for b in final_response.content):
+                    final_text = accumulated_text or "".join(
+                        b.text for b in final_response.content if b.type == "text"
+                    )
+                    await self.memory.add_message(session_id, "assistant", final_text, interface)
+                    self._schedule_compaction(session_id)
+                    yield StreamEvent(type="complete", text=final_text)
+                    return
+
+                # Handle tool_use blocks (same parallel logic as run())
+                assistant_content = []
+                tool_use_blocks = []
+                for block in final_response.content:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                    elif block.type == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use", "id": block.id,
+                            "name": block.name, "input": block.input,
+                        })
+                        tool_use_blocks.append(block)
+                        yield StreamEvent(
+                            type="tool_call", tool_name=block.name, tool_input=block.input,
+                        )
+
+                tool_results = []
+                exec_blocks = []
+                for b in tool_use_blocks:
+                    if b.name == "tool-search":
+                        result_text = self._handle_tool_search(b.input, active_tools, loaded_tool_names)
+                        tool_results.append({
+                            "type": "tool_result", "tool_use_id": b.id, "content": result_text,
+                        })
+                        yield StreamEvent(
+                            type="tool_result", tool_name=b.name, tool_result=result_text[:200],
+                        )
+                    else:
+                        exec_blocks.append(b)
+
+                if exec_blocks:
+                    results = await asyncio.gather(
+                        *(self._execute_tool(b.name, b.input, session_id=session_id)
+                          for b in exec_blocks),
+                        return_exceptions=True,
+                    )
+                    for b, r in zip(exec_blocks, results):
+                        content = (
+                            f"Error executing {b.name}: {r}"
+                            if isinstance(r, Exception) else r
+                        )
+                        tool_results.append({
+                            "type": "tool_result", "tool_use_id": b.id, "content": content,
+                        })
+                        yield StreamEvent(
+                            type="tool_result", tool_name=b.name, tool_result=content[:200],
+                        )
+
+                order = {b.id: i for i, b in enumerate(tool_use_blocks)}
+                tool_results.sort(key=lambda r: order.get(r["tool_use_id"], 0))
+
+                messages.append({"role": "assistant", "content": assistant_content})
+                messages.append({"role": "user", "content": tool_results})
+
+            # Hit iteration limit
+            fallback = "Hit the tool loop limit. Tell me to continue if you want me to keep going."
+            await self.memory.add_message(session_id, "assistant", fallback, interface)
+            yield StreamEvent(type="complete", text=fallback)
+
+        except Cancelled:
+            yield StreamEvent(type="cancelled")
+
+    def _schedule_compaction(self, session_id: str) -> None:
+        """Fire-and-forget compaction after a turn completes.
+
+        The user already has their response — compaction can run in the
+        background without adding to perceived latency."""
+        if self.compactor is None:
+            return
+        try:
+            asyncio.create_task(self._compact_safely(session_id))
+        except RuntimeError:
+            # No running loop (test contexts) — caller can run compactor manually
+            pass
+
+    async def _compact_safely(self, session_id: str) -> None:
+        try:
+            brief = await self.compactor.maybe_compact(session_id)
+            if brief:
+                logger.info("Compacted session %s — %d rows summarized",
+                            session_id, brief.rows_compacted)
+        except Exception as e:
+            logger.warning("Compaction failed for %s: %s", session_id, e)
 
     async def _get_daily_context(self) -> list[str]:
         """Return today's commitments/MEDDIC-gap lines, cached per-day.

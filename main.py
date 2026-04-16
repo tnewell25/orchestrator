@@ -10,6 +10,7 @@ from .config import get_settings
 from .core.agent import Agent
 from .core.audit import AuditLogger
 from .core.calendar_sync import CalendarAutoSync
+from .core.compactor import Compactor
 from .core.entity_extractor import EntityExtractor
 from .core.graph import GraphStore
 from .core.memory import MemoryStore
@@ -165,6 +166,10 @@ async def lifespan(app: FastAPI):
     # 5. Agent — with planner if we have an LLM client; lazy tool loading
     # so the always-loaded prompt prefix stays small and cache-stable.
     planner = Planner(extractor_client, fast_model=settings.fast_model) if extractor_client else None
+    compactor = (
+        Compactor(memory.session_maker, extractor_client, fast_model=settings.fast_model)
+        if extractor_client else None
+    )
     agent = Agent(
         memory=memory,
         skills=skills,
@@ -174,6 +179,7 @@ async def lifespan(app: FastAPI):
         planner=planner,
         entity_extractor=extractor,
         lazy_tools=True,
+        compactor=compactor,
     )
     logger.info(
         "Agent initialized — full catalog %d tools, lazy mode on (planner=%s)",

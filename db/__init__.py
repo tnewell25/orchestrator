@@ -1,6 +1,7 @@
 from .models import (
     Base,
     Conversation,
+    SessionBrief,
     Fact,
     OAuthToken,
     AuditLog,
@@ -34,6 +35,7 @@ from .models import (
 __all__ = [
     "Base",
     "Conversation",
+    "SessionBrief",
     "Fact",
     "OAuthToken",
     "AuditLog",
