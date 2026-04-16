@@ -31,7 +31,10 @@ Output a single dense paragraph (3-6 sentences) capturing:
 
 Skip pleasantries, repeated tool-call mechanics, anything obvious from the
 current open items. Future-you will read this as a quick prelude before the
-next turn — write so they instantly know where things stand."""
+next turn — write so they instantly know where things stand.
+
+If a FOCUS hint is provided, preserve detail about that entity/topic first —
+drop other context aggressively. Without a hint, weight everything equally."""
 
 
 class Compactor:
@@ -53,8 +56,19 @@ class Compactor:
         # Keep this many most-recent rows uncompacted (the active window)
         self.keep_recent = keep_recent
 
-    async def maybe_compact(self, session_id: str) -> SessionBrief | None:
+    async def maybe_compact(
+        self,
+        session_id: str,
+        focus_hint: str = "",
+        intent: str = "",
+    ) -> SessionBrief | None:
         """Compact if and only if the live row count exceeds threshold.
+
+        focus_hint: entity name/topic the user is currently working on. Compactor
+        preserves detail about this entity and drops unrelated context more
+        aggressively, reducing lossy compression on the parts that matter.
+        intent: current planner intent (CRUD/QUERY/PREP/STRATEGY/RESEARCH) —
+        helps the summarizer know what to highlight.
 
         Returns the new brief if one was created, else None. Safe to call
         after every agent turn — fires the LLM only when needed.
@@ -74,14 +88,13 @@ class Compactor:
         if len(rows) < self.compact_threshold:
             return None
 
-        # Slice — older rows get rolled up; recent ones stay live.
         n_to_compact = len(rows) - self.keep_recent
         if n_to_compact <= 0:
             return None
         to_compact = rows[:n_to_compact]
         boundary_ts = to_compact[-1].timestamp
 
-        summary_text = await self._summarize(to_compact)
+        summary_text = await self._summarize(to_compact, focus_hint=focus_hint, intent=intent)
         if not summary_text:
             logger.warning("Compactor produced empty summary, skipping compaction")
             return None
@@ -90,19 +103,32 @@ class Compactor:
             session_id, summary_text, to_compact, boundary_ts,
         )
 
-    async def _summarize(self, rows: list[Conversation]) -> str:
+    async def _summarize(
+        self,
+        rows: list[Conversation],
+        focus_hint: str = "",
+        intent: str = "",
+    ) -> str:
         if not self.client:
             return ""
-        # Render the raw transcript — kept compact for Haiku context budget
         transcript = "\n".join(
             f"{r.role}: {r.content[:400]}" for r in rows
+        )
+        hint_parts = []
+        if focus_hint:
+            hint_parts.append(f"FOCUS: {focus_hint} — preserve detail about this; drop unrelated context.")
+        if intent:
+            hint_parts.append(f"CURRENT INTENT: {intent}")
+        user_content = (
+            ("\n".join(hint_parts) + "\n\nTranscript:\n" + transcript)
+            if hint_parts else transcript
         )
         try:
             resp = await self.client.messages.create(
                 model=self.fast_model,
                 max_tokens=600,
                 system=_COMPACT_SYSTEM,
-                messages=[{"role": "user", "content": transcript}],
+                messages=[{"role": "user", "content": user_content}],
             )
             return "".join(b.text for b in resp.content if b.type == "text").strip()
         except Exception as e:

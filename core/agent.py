@@ -351,7 +351,7 @@ class Agent:
                 await self.memory.add_message(
                     session_id, "assistant", final_text, interface
                 )
-                self._schedule_compaction(session_id)
+                self._schedule_compaction(session_id, plan=plan)
                 return final_text
 
             assistant_content = []
@@ -557,7 +557,7 @@ class Agent:
                         b.text for b in final_response.content if b.type == "text"
                     )
                     await self.memory.add_message(session_id, "assistant", final_text, interface)
-                    self._schedule_compaction(session_id)
+                    self._schedule_compaction(session_id, plan=plan)
                     yield StreamEvent(type="complete", text=final_text)
                     return
 
@@ -623,22 +623,35 @@ class Agent:
         except Cancelled:
             yield StreamEvent(type="cancelled")
 
-    def _schedule_compaction(self, session_id: str) -> None:
+    def _schedule_compaction(self, session_id: str, plan: Plan | None = None) -> None:
         """Fire-and-forget compaction after a turn completes.
 
-        The user already has their response — compaction can run in the
-        background without adding to perceived latency."""
+        Passes focus + intent so the Haiku summarizer preserves the parts of
+        the conversation the user is currently working on. The user already
+        has their response — compaction runs in the background."""
         if self.compactor is None:
             return
+        focus_hint = ""
+        intent = ""
+        if plan is not None:
+            if plan.focus is not None:
+                focus_hint = str(plan.focus)
+            intent = plan.intent or ""
         try:
-            asyncio.create_task(self._compact_safely(session_id))
+            asyncio.create_task(
+                self._compact_safely(session_id, focus_hint=focus_hint, intent=intent)
+            )
         except RuntimeError:
             # No running loop (test contexts) — caller can run compactor manually
             pass
 
-    async def _compact_safely(self, session_id: str) -> None:
+    async def _compact_safely(
+        self, session_id: str, focus_hint: str = "", intent: str = "",
+    ) -> None:
         try:
-            brief = await self.compactor.maybe_compact(session_id)
+            brief = await self.compactor.maybe_compact(
+                session_id, focus_hint=focus_hint, intent=intent,
+            )
             if brief:
                 logger.info("Compacted session %s — %d rows summarized",
                             session_id, brief.rows_compacted)

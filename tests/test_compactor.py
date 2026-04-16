@@ -103,6 +103,41 @@ async def test_compactor_handles_llm_failure_gracefully(session_maker):
 
 
 @pytest.mark.asyncio
+async def test_steered_compaction_passes_focus_and_intent_to_llm(session_maker):
+    """Focus + intent hints show up in the user message sent to Haiku."""
+    await _seed_messages(session_maker, "s1", n=50)
+
+    client = _fake_anthropic_client("steered summary")
+    compactor = Compactor(
+        session_maker, client,
+        compact_threshold=40, keep_recent=15,
+    )
+    brief = await compactor.maybe_compact(
+        "s1", focus_hint="Deal:bosch-1", intent="STRATEGY",
+    )
+    assert brief is not None
+
+    call_kwargs = client.messages.create.call_args.kwargs
+    user_content = call_kwargs["messages"][0]["content"]
+    assert "FOCUS: Deal:bosch-1" in user_content
+    assert "CURRENT INTENT: STRATEGY" in user_content
+
+
+@pytest.mark.asyncio
+async def test_compactor_without_hints_matches_original_shape(session_maker):
+    """No hints → transcript is the raw user content (back-compat)."""
+    await _seed_messages(session_maker, "s1", n=50)
+    client = _fake_anthropic_client("plain")
+    compactor = Compactor(session_maker, client, compact_threshold=40, keep_recent=15)
+    await compactor.maybe_compact("s1")
+
+    call_kwargs = client.messages.create.call_args.kwargs
+    user_content = call_kwargs["messages"][0]["content"]
+    assert "FOCUS:" not in user_content
+    assert "CURRENT INTENT:" not in user_content
+
+
+@pytest.mark.asyncio
 async def test_compactor_skips_without_client(session_maker):
     await _seed_messages(session_maker, "s1", n=50)
     compactor = Compactor(session_maker, anthropic_client=None,
