@@ -30,6 +30,7 @@ from .constants import (
     RECENCY_HALF_LIFE_DAYS,
     EntityType,
 )
+from .schema_patches import apply_schema_patches
 
 if TYPE_CHECKING:
     from .entity_extractor import EntityExtractor
@@ -176,6 +177,10 @@ class MemoryStore:
                         )
                     except Exception as e:
                         logger.warning("Could not add embedding to %s: %s", tbl, e)
+
+            # Apply idempotent column/index patches for schema drift on
+            # pre-existing tables (create_all doesn't ALTER existing tables).
+            await apply_schema_patches(conn)
 
     # -- Conversations --
 
