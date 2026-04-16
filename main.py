@@ -12,9 +12,13 @@ from .core.audit import AuditLogger
 from .core.calendar_sync import CalendarAutoSync
 from .core.compactor import Compactor
 from .core.entity_extractor import EntityExtractor
+from .core.events import EventBus
 from .core.graph import GraphStore
 from .core.memory import MemoryStore
 from .core.planner import Planner
+from .core.rule_engine import ActionDispatcher, RuleEngine
+from .core.scheduler_tick import SchedulerTick
+from .interfaces.webhooks import build_webhook_router
 from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
 from .core.token_manager import TokenManager
@@ -186,6 +190,20 @@ async def lifespan(app: FastAPI):
         len(agent.tools), bool(planner),
     )
 
+    # 5b. Event bus + rule engine — proactive logic moves from polling to events.
+    event_bus = EventBus()
+    dispatcher = ActionDispatcher(sm, event_bus)
+    rule_engine = RuleEngine(event_bus, sm, dispatcher)
+    rule_engine.register_builtins()
+    app.state.event_bus = event_bus
+    app.state.rule_engine = rule_engine
+
+    # Mount webhook receivers so Gmail Pub/Sub and Calendar push translate
+    # into bus events. expected_token comes from settings if you want auth;
+    # safer to use mutual TLS or a JWT verifier in front of this.
+    app.include_router(build_webhook_router(event_bus))
+    logger.info("EventBus + rule engine ready, webhooks mounted at /webhooks")
+
     # 6. Telegram bot (optional — fail soft)
     if settings.telegram_bot_token:
         try:
@@ -218,10 +236,26 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.exception("ProactiveMonitor failed: %s", e)
 
+    # Scheduler tick — fires HOURLY/DAILY events the rule engine reacts to.
+    scheduler_tick: SchedulerTick | None = None
+    try:
+        scheduler_tick = SchedulerTick(
+            event_bus, default_chat_id=default_chat_id,
+            sweep_payload_extra={
+                "stalled_deal_days": settings.stalled_deal_days,
+            },
+        )
+        await scheduler_tick.start()
+        app.state.scheduler_tick = scheduler_tick
+    except Exception as e:
+        logger.exception("SchedulerTick failed: %s", e)
+
     logger.info("=== Orchestrator ready ===")
     yield
 
     # Shutdown — reverse order
+    if scheduler_tick:
+        await scheduler_tick.stop()
     if proactive_monitor:
         await proactive_monitor.stop()
     if calendar_sync:
