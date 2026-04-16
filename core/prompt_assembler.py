@@ -146,12 +146,16 @@ class PromptAssembler:
         focus_subgraph: Subgraph | None = None,
         daily_context_lines: list[str] | None = None,
         session_brief: str = "",
+        strategy_context: str = "",
     ) -> AssembledPrompt:
         return AssembledPrompt(
             block_a=self._block_a_cached,
             block_b=self._render_block_b(facts),
             block_c=self._render_block_c(daily_context_lines or []),
-            block_d=self._render_block_d(plan, memories, focus_subgraph, session_brief),
+            block_d=self._render_block_d(
+                plan, memories, focus_subgraph, session_brief,
+                strategy_context=strategy_context,
+            ),
         )
 
     def _render_block_b(self, facts: list[dict]) -> str:
@@ -185,13 +189,17 @@ class PromptAssembler:
         memories: list[dict],
         focus_subgraph: Subgraph | None,
         session_brief: str = "",
+        strategy_context: str = "",
     ) -> str:
-        """Per-turn volatile context — focus, memories, mode hint, and the
-        compacted-history brief (when older turns have been rolled up)."""
+        """Per-turn volatile context — focus, memories, mode hint, compacted
+        history, and (for STRATEGY intent) pre-synthesized lessons + relationships."""
         parts: list[str] = []
 
         if session_brief:
             parts.append("EARLIER CONVERSATION SUMMARY:\n" + session_brief)
+
+        if strategy_context:
+            parts.append("STRATEGIC CONTEXT (pre-synthesized by sub-agents):\n" + strategy_context)
 
         mode_hint = MODE_HINTS.get(plan.intent, "")
         if mode_hint:

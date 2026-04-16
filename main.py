@@ -21,6 +21,7 @@ from .core.pipeline_watcher import PipelineWatcher
 from .core.planner import Planner
 from .core.rule_engine import ActionDispatcher, RuleEngine
 from .core.scheduler_tick import SchedulerTick
+from .core.strategy_fanout import StrategyFanout
 from .interfaces.webhooks import build_webhook_router
 from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
@@ -189,6 +190,10 @@ async def lifespan(app: FastAPI):
     action_gate = ActionGate(memory.session_maker)
     # Create event bus BEFORE agent so cost alerts can publish from the first turn.
     event_bus = EventBus()
+    strategy_fanout = (
+        StrategyFanout(memory.session_maker, extractor_client, fast_model=settings.fast_model)
+        if extractor_client else None
+    )
     agent = Agent(
         memory=memory,
         skills=skills,
@@ -201,6 +206,7 @@ async def lifespan(app: FastAPI):
         compactor=compactor,
         action_gate=action_gate,
         event_bus=event_bus,
+        strategy_fanout=strategy_fanout,
     )
     app.state.action_gate = action_gate
     logger.info(

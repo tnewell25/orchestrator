@@ -16,6 +16,7 @@ from .graph import EntityRef
 from .planner import Intent, Plan
 from .prompt_assembler import PromptAssembler, build_daily_context_lines
 from .skill_base import Safety
+from .strategy_fanout import StrategyFanout
 from .tool_registry import DEFAULT_ESSENTIALS, ToolRegistry, tool_search_schema
 
 if TYPE_CHECKING:
@@ -62,6 +63,7 @@ class Agent:
         compactor: "Compactor | None" = None,
         action_gate: "ActionGate | None" = None,
         event_bus: "EventBus | None" = None,
+        strategy_fanout: "StrategyFanout | None" = None,
     ):
         self.memory = memory
         self.skills = {s.name: s for s in skills}
@@ -101,6 +103,10 @@ class Agent:
         # Cumulative session input tokens. Cleared when SESSION_COST_EXCEEDED
         # fires so we don't re-spam the event.
         self._session_tokens: dict[str, int] = {}
+        # Optional — when set + intent=STRATEGY, fires two parallel Haiku
+        # sub-agents (lessons + relationships) before the main call so the
+        # Sonnet pass gets pre-synthesized context instead of raw tables.
+        self.strategy_fanout = strategy_fanout
 
         self._init_client()
 
@@ -265,6 +271,18 @@ class Agent:
 
         daily_lines = await self._get_daily_context()
 
+        # Parallel STRATEGY fan-out — cheap Haiku sub-agents pre-synthesize
+        # historical lessons + relationship map so Sonnet can focus on strategy
+        # synthesis instead of rediscovering the raw tables.
+        strategy_context = ""
+        if self.strategy_fanout is not None and self.strategy_fanout.should_run(plan):
+            try:
+                sc = await self.strategy_fanout.gather(plan)
+                if not sc.is_empty():
+                    strategy_context = sc.to_block()
+            except Exception as e:
+                logger.warning("Strategy fanout failed: %s", e)
+
         assembled = self.prompt_assembler.assemble(
             facts=facts,
             memories=memories,
@@ -272,6 +290,7 @@ class Agent:
             focus_subgraph=focus_subgraph,
             daily_context_lines=daily_lines,
             session_brief=session_brief,
+            strategy_context=strategy_context,
         )
         system_blocks = assembled.to_anthropic_blocks()
 
