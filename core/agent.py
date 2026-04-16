@@ -53,7 +53,7 @@ class Agent:
         settings,
         token_manager=None,
         audit_logger=None,
-        max_iterations: int = 15,
+        max_iterations: int | None = None,
         planner: "Planner | None" = None,
         entity_extractor=None,
         lazy_tools: bool = False,
@@ -66,7 +66,18 @@ class Agent:
         self.settings = settings
         self.token_manager = token_manager
         self.audit_logger = audit_logger
-        self.max_iterations = max_iterations
+        # Iteration cap — pulled from settings (8) unless caller overrides.
+        # Most turns complete in 3-5 iters; 8 catches long chains without
+        # letting runaways burn budget.
+        self.max_iterations = (
+            max_iterations if max_iterations is not None
+            else int(getattr(settings, "max_agent_iterations", 8) or 8)
+        )
+        # How many recent messages to replay per turn. Smaller window = lower
+        # cost + better cache stability; compaction covers older context.
+        self.conversation_window = int(
+            getattr(settings, "conversation_window_limit", 15) or 15
+        )
         self.planner = planner
         self.entity_extractor = entity_extractor
         # When True, only essentials + tool-search are loaded by default;
@@ -106,6 +117,33 @@ class Agent:
         tools_out = [dict(t) for t in src]
         tools_out[-1] = {**tools_out[-1], "cache_control": {"type": "ephemeral"}}
         return tools_out
+
+    def _select_model_and_thinking(self, plan: Plan) -> tuple[str, dict | None]:
+        """Pick the cheapest model that still does the job + decide if extended
+        thinking is worth the token tax for this intent.
+
+        - CRUD/QUERY → fast_model (Haiku). ~60% cheaper, quality indistinguishable.
+        - PREP/RESEARCH → default_model (Sonnet). Needs synthesis quality.
+        - STRATEGY → default_model + extended thinking. Worth the tax for hard calls.
+        - AMBIGUOUS → default_model, no thinking. Let the agent disambiguate.
+
+        Override per-call via settings.fast_model_intents (comma-separated).
+        """
+        fast_intents = set(
+            s.strip() for s in (getattr(self.settings, "fast_model_intents", "CRUD,QUERY") or "").split(",")
+            if s.strip()
+        )
+        model = self.settings.default_model
+        thinking = None
+
+        if plan.intent in fast_intents:
+            model = self.settings.fast_model
+        elif plan.intent == Intent.STRATEGY or plan.use_thinking:
+            budget = int(getattr(self.settings, "thinking_budget_tokens", 5000) or 0)
+            if budget > 0:
+                thinking = {"type": "enabled", "budget_tokens": budget}
+
+        return model, thinking
 
     def _initial_active_tools(self, plan: Plan | None = None) -> list[dict]:
         """Build the per-call tool list.
@@ -175,7 +213,9 @@ class Agent:
         interface: str = "telegram",
         model: str | None = None,
     ) -> str:
-        model = model or self.settings.default_model
+        # Model override wins; otherwise we pick based on planner intent below
+        # so cheap reads run on Haiku and strategy calls get thinking.
+        override_model = model
 
         if self.token_manager:
             await self.token_manager.ensure_token()
@@ -183,13 +223,17 @@ class Agent:
 
         await self.memory.add_message(session_id, "user", message, interface)
 
-        conversation = await self.memory.get_conversation(session_id, limit=30)
+        conversation = await self.memory.get_conversation(session_id, limit=self.conversation_window)
         facts = await self.memory.get_facts()
 
         # Planner pass — identify focus entity + intent so recall_hybrid gets
         # proximity boost and the system prompt knows what mode to surface.
         plan = await self._run_planner(message, conversation)
         focus_ref = plan.focus
+
+        # Intent-aware model selection — huge cost lever on CRUD/QUERY traffic.
+        intent_model, thinking = self._select_model_and_thinking(plan)
+        model = override_model or intent_model
 
         memories = await self.memory.recall(message, limit=5, focus_ref=focus_ref)
 
@@ -245,13 +289,16 @@ class Agent:
             response = None
             while response is None:
                 try:
-                    response = await self.client.messages.create(
+                    kwargs = dict(
                         model=model,
                         max_tokens=4096,
                         system=system_blocks,
                         tools=self._cache_controlled_tools(active_tools) if active_tools else anthropic.NOT_GIVEN,
                         messages=messages,
                     )
+                    if thinking is not None:
+                        kwargs["thinking"] = thinking
+                    response = await self.client.messages.create(**kwargs)
                 except anthropic.AuthenticationError:
                     if not recovered_this_run and self.token_manager:
                         recovered_this_run = True
@@ -381,17 +428,22 @@ class Agent:
         Pass cancel_event to allow interruption — if set between iterations or
         between stream events, the agent stops cleanly without a partial commit.
         """
-        model = model or self.settings.default_model
+        override_model = model
         if self.token_manager:
             await self.token_manager.ensure_token()
             self._init_client()
 
         await self.memory.add_message(session_id, "user", message, interface)
 
-        conversation = await self.memory.get_conversation(session_id, limit=30)
+        conversation = await self.memory.get_conversation(session_id, limit=self.conversation_window)
         facts = await self.memory.get_facts()
         plan = await self._run_planner(message, conversation)
         focus_ref = plan.focus
+
+        # Intent-aware model selection (same lever as run()).
+        intent_model, thinking = self._select_model_and_thinking(plan)
+        model = override_model or intent_model
+
         memories = await self.memory.recall(message, limit=5, focus_ref=focus_ref)
 
         session_brief = ""
@@ -439,13 +491,16 @@ class Agent:
                 accumulated_text = ""
                 final_response = None
                 try:
-                    async with self.client.messages.stream(
+                    stream_kwargs = dict(
                         model=model,
                         max_tokens=4096,
                         system=system_blocks,
                         tools=self._cache_controlled_tools(active_tools) if active_tools else anthropic.NOT_GIVEN,
                         messages=messages,
-                    ) as stream:
+                    )
+                    if thinking is not None:
+                        stream_kwargs["thinking"] = thinking
+                    async with self.client.messages.stream(**stream_kwargs) as stream:
                         async for ev in stream:
                             _check_cancel()
                             # SDK >= 0.25 emits TextEvent / ContentBlockDeltaEvent

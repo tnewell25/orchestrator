@@ -77,6 +77,7 @@ def _build_agent(stream_factory):
     agent.token_manager = None
     agent.audit_logger = None
     agent.max_iterations = 5
+    agent.conversation_window = 15
     agent.planner = None
     agent.entity_extractor = None
     agent.lazy_tools = False

@@ -16,6 +16,16 @@ class Settings(BaseSettings):
     anthropic_refresh_token: str = ""
     default_model: str = "claude-sonnet-4-5-20250929"
     fast_model: str = "claude-haiku-4-5-20251001"
+    # Intents where the main agent call uses fast_model instead of default_model.
+    # CRUD/QUERY are ~60% cheaper on Haiku and quality is indistinguishable
+    # for simple reads/writes. STRATEGY/PREP/RESEARCH stay on default_model.
+    fast_model_intents: str = "CRUD,QUERY"
+    # Extended-thinking budget (tokens). Enabled only for STRATEGY intent by
+    # default so we don't pay the thinking tax on routine CRUD traffic.
+    thinking_budget_tokens: int = 5000
+    # Loop caps
+    max_agent_iterations: int = 8
+    conversation_window_limit: int = 15
 
     # Embeddings (local via fastembed)
     embedding_model: str = "BAAI/bge-small-en-v1.5"
