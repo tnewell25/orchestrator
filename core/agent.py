@@ -327,9 +327,14 @@ class Agent:
             call_start = time.perf_counter()
             while response is None:
                 try:
+                    # max_tokens must exceed thinking.budget_tokens when thinking
+                    # is enabled — Anthropic enforces this strictly.
+                    max_tokens = 4096
+                    if thinking is not None:
+                        max_tokens = max(max_tokens, int(thinking.get("budget_tokens", 0)) + 2048)
                     kwargs = dict(
                         model=model,
-                        max_tokens=4096,
+                        max_tokens=max_tokens,
                         system=system_blocks,
                         tools=self._cache_controlled_tools(active_tools) if active_tools else anthropic.NOT_GIVEN,
                         messages=messages,
@@ -567,9 +572,12 @@ class Agent:
                 final_response = None
                 call_start = time.perf_counter()
                 try:
+                    max_tokens = 4096
+                    if thinking is not None:
+                        max_tokens = max(max_tokens, int(thinking.get("budget_tokens", 0)) + 2048)
                     stream_kwargs = dict(
                         model=model,
-                        max_tokens=4096,
+                        max_tokens=max_tokens,
                         system=system_blocks,
                         tools=self._cache_controlled_tools(active_tools) if active_tools else anthropic.NOT_GIVEN,
                         messages=messages,
