@@ -45,6 +45,7 @@ from .skills.reminder_skill import ReminderSkill
 from .skills.research_skill import ResearchSkill
 from .skills.stakeholder_skill import StakeholderSkill
 from .skills.task_skill import TaskSkill
+from .skills.usage_skill import UsageSkill
 from .skills.weekly_review_skill import WeeklyReviewSkill
 
 logging.basicConfig(
@@ -156,6 +157,7 @@ async def lifespan(app: FastAPI):
         ReminderSkill(sm, default_chat_id=default_chat_id, user_timezone=user_tz),
         BriefingSkill(sm),
         WeeklyReviewSkill(sm),
+        UsageSkill(sm),
         # Pipeline intelligence
         StakeholderSkill(sm),
         DealHealthSkill(sm),
