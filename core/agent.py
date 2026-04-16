@@ -327,9 +327,11 @@ class Agent:
             call_start = time.perf_counter()
             while response is None:
                 try:
-                    # max_tokens must exceed thinking.budget_tokens when thinking
-                    # is enabled — Anthropic enforces this strictly.
-                    max_tokens = 4096
+                    # max_tokens is a REQUIRED Anthropic param capping one reply's
+                    # length (not total cost). 16k is far above typical replies;
+                    # thinking budget fits below it. You pay only for tokens
+                    # actually generated — this is a ceiling, not a bill.
+                    max_tokens = 16384
                     if thinking is not None:
                         max_tokens = max(max_tokens, int(thinking.get("budget_tokens", 0)) + 2048)
                     kwargs = dict(
@@ -572,7 +574,7 @@ class Agent:
                 final_response = None
                 call_start = time.perf_counter()
                 try:
-                    max_tokens = 4096
+                    max_tokens = 16384
                     if thinking is not None:
                         max_tokens = max(max_tokens, int(thinking.get("budget_tokens", 0)) + 2048)
                     stream_kwargs = dict(
