@@ -112,6 +112,17 @@ class AuditLog(Base):
     duration_ms = Column(Integer, nullable=False, default=0)
     safety = Column(String, default="auto")  # auto | confirm | approve_external
 
+    # Token accounting for the messages.create API call. Populated on
+    # rows where tool_name="_turn"; zero on per-tool-call rows.
+    # cache_read = hit on the cached prefix (90% cheaper than regular input).
+    # cache_creation = first time a prefix was cached (priced ~25% higher).
+    # Seeing cache_read >> cache_creation across a session means W5 is working.
+    model = Column(String, default="")
+    input_tokens = Column(Integer, default=0)
+    output_tokens = Column(Integer, default=0)
+    cache_read_tokens = Column(Integer, default=0)
+    cache_creation_tokens = Column(Integer, default=0)
+
 
 class PendingAction(Base):
     """Externally-visible actions queued for user approval before execution.

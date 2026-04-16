@@ -287,6 +287,7 @@ class Agent:
                 await asyncio.sleep(ITER_DELAY_S)
 
             response = None
+            call_start = time.perf_counter()
             while response is None:
                 try:
                     kwargs = dict(
@@ -329,6 +330,19 @@ class Agent:
                     )
                     await asyncio.sleep(retry_after)
                     continue  # retry same call
+
+            # Token accounting — one audit row per messages.create round-trip.
+            # Fire-and-forget; audit failures can't block the agent loop.
+            if self.audit_logger and getattr(response, "usage", None) is not None:
+                try:
+                    await self.audit_logger.log_usage(
+                        session_id=session_id, model=model,
+                        usage=response.usage,
+                        duration_ms=int((time.perf_counter() - call_start) * 1000),
+                        iteration=iteration,
+                    )
+                except Exception:
+                    pass
 
             if not any(b.type == "tool_use" for b in response.content):
                 final_text = "".join(
@@ -490,6 +504,7 @@ class Agent:
 
                 accumulated_text = ""
                 final_response = None
+                call_start = time.perf_counter()
                 try:
                     stream_kwargs = dict(
                         model=model,
@@ -525,6 +540,17 @@ class Agent:
                 if final_response is None:
                     yield StreamEvent(type="error", error="empty stream response")
                     return
+
+                if self.audit_logger and getattr(final_response, "usage", None) is not None:
+                    try:
+                        await self.audit_logger.log_usage(
+                            session_id=session_id, model=model,
+                            usage=final_response.usage,
+                            duration_ms=int((time.perf_counter() - call_start) * 1000),
+                            iteration=iteration,
+                        )
+                    except Exception:
+                        pass
 
                 if not any(b.type == "tool_use" for b in final_response.content):
                     final_text = accumulated_text or "".join(
