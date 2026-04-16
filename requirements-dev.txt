@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Test stack — async sqlite for fast in-memory test DBs (no postgres needed),
+# pytest-asyncio for the async-mode tests.
+pytest>=8.0
+pytest-asyncio>=0.23
+aiosqlite>=0.19
