@@ -6,6 +6,7 @@ via `Base.metadata.create_all`.
 """
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import uuid
@@ -67,6 +68,17 @@ def _reinforcement_boost(count: int) -> float:
 # instead of a new memory. Longer = more aggressive dedup; shorter = more
 # lenient for long-running agent sessions where the user might legit restate a fact.
 DEDUP_WINDOW_SECONDS = 60
+
+
+def _json_load_list(s: str | None) -> list:
+    """Tolerant JSON array parser — empty string / None / malformed → []."""
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, list) else []
+    except (ValueError, TypeError):
+        return []
 
 
 def _content_hash(content: str) -> str:
@@ -306,7 +318,14 @@ class MemoryStore:
         # fastembed returns numpy arrays; injected test embedders may return lists
         return first.tolist() if hasattr(first, "tolist") else list(first)
 
-    async def store_memory(self, content: str, source: str = "conversation") -> str:
+    async def store_memory(
+        self,
+        content: str,
+        source: str = "conversation",
+        title: str = "",
+        facts: list[str] | None = None,
+        concepts: list[str] | None = None,
+    ) -> str:
         """Low-level write — embeds and inserts. Returns the memory id.
 
         Dedup: if an identical memory was stored in the last DEDUP_WINDOW_SECONDS,
@@ -314,6 +333,11 @@ class MemoryStore:
         existing id instead of re-embedding + re-inserting. This halves DB
         growth on tool-loop retries and is the key to reinforcement_count
         meaningfully tracking "how often I've seen this fact."
+
+        title/facts/concepts are optional structured fields. When present, they
+        let Block D render tighter (title + bullets) and hybrid recall filter
+        on concept tags. Callers that have structured data (MeetingSkill,
+        EmailTriageSkill) should populate them; others can pass raw content only.
 
         Does NOT extract entities. Use remember() for the full pipeline.
         """
@@ -343,35 +367,38 @@ class MemoryStore:
 
         memory_id = str(uuid.uuid4())
         embedding = await self._embed(content)
+        facts_json = json.dumps(facts) if facts else ""
+        concepts_json = json.dumps(concepts) if concepts else ""
         async with self.session_maker() as session:
             if getattr(self, "_vector_enabled", True):
                 await session.execute(
                     text(
                         "INSERT INTO semantic_memories "
                         "(id, content, embedding, timestamp, reinforcement_count, "
-                        " last_reinforced_at, source, content_hash) "
-                        "VALUES (:id, :content, CAST(:embedding AS vector), :ts, 1, :ts, :source, :hash)"
+                        " last_reinforced_at, source, content_hash, title, facts_json, concepts_json) "
+                        "VALUES (:id, :content, CAST(:embedding AS vector), :ts, 1, :ts, "
+                        "        :source, :hash, :title, :facts, :concepts)"
                     ),
                     {
-                        "id": memory_id,
-                        "content": content,
-                        "embedding": str(embedding),
-                        "ts": now,
-                        "source": source,
-                        "hash": hash_,
+                        "id": memory_id, "content": content,
+                        "embedding": str(embedding), "ts": now,
+                        "source": source, "hash": hash_,
+                        "title": title[:200], "facts": facts_json,
+                        "concepts": concepts_json,
                     },
                 )
             else:
-                # Fallback when pgvector isn't installed (dev/test against sqlite)
                 await session.execute(
                     text(
                         "INSERT INTO semantic_memories "
                         "(id, content, timestamp, reinforcement_count, "
-                        " last_reinforced_at, source, content_hash) "
-                        "VALUES (:id, :content, :ts, 1, :ts, :source, :hash)"
+                        " last_reinforced_at, source, content_hash, title, facts_json, concepts_json) "
+                        "VALUES (:id, :content, :ts, 1, :ts, :source, :hash, :title, :facts, :concepts)"
                     ),
                     {"id": memory_id, "content": content, "ts": now,
-                     "source": source, "hash": hash_},
+                     "source": source, "hash": hash_,
+                     "title": title[:200], "facts": facts_json,
+                     "concepts": concepts_json},
                 )
             await session.commit()
         return memory_id
@@ -381,6 +408,9 @@ class MemoryStore:
         content: str,
         source: str = "conversation",
         extract_entities: bool = True,
+        title: str = "",
+        facts: list[str] | None = None,
+        concepts: list[str] | None = None,
     ) -> str:
         """High-level write — store + extract entities + create graph edges.
 
@@ -388,9 +418,15 @@ class MemoryStore:
         kicks off the LLM extractor in the background (set llm_background=True
         when calling attach_extractor).
 
+        Structured args (title/facts/concepts) are pass-through to store_memory;
+        populate them when you have them for richer Block D rendering.
+
         Returns the new memory id so callers can reference it.
         """
-        memory_id = await self.store_memory(content, source=source)
+        memory_id = await self.store_memory(
+            content, source=source, title=title,
+            facts=facts, concepts=concepts,
+        )
 
         if extract_entities and self._extractor is not None:
             from .graph import EntityRef
@@ -475,6 +511,9 @@ class MemoryStore:
             scored.append({
                 "id": c["id"],
                 "content": c["content"],
+                "title": c.get("title", ""),
+                "facts": c.get("facts", []),
+                "concepts": c.get("concepts", []),
                 "timestamp": str(ts) if ts else "",
                 "source": c["source"],
                 "similarity": round(c["similarity"], 3),
@@ -547,6 +586,7 @@ class MemoryStore:
                     text(
                         "SELECT id, content, timestamp, source, "
                         "       reinforcement_count, last_reinforced_at, "
+                        "       title, facts_json, concepts_json, "
                         "       1 - (embedding <=> CAST(:embedding AS vector)) AS similarity "
                         "FROM semantic_memories "
                         "WHERE embedding IS NOT NULL "
@@ -561,7 +601,10 @@ class MemoryStore:
                         "id": r[0], "content": r[1], "timestamp": r[2], "source": r[3],
                         "reinforcement_count": r[4] or 1,
                         "last_reinforced_at": r[5],
-                        "similarity": float(r[6]),
+                        "title": r[6] or "",
+                        "facts": _json_load_list(r[7]),
+                        "concepts": _json_load_list(r[8]),
+                        "similarity": float(r[9]),
                     }
                     for r in result.fetchall()
                 ]
@@ -580,6 +623,9 @@ class MemoryStore:
                 "id": r.id, "content": r.content, "timestamp": r.timestamp, "source": r.source,
                 "reinforcement_count": r.reinforcement_count or 1,
                 "last_reinforced_at": r.last_reinforced_at,
+                "title": r.title or "",
+                "facts": _json_load_list(r.facts_json),
+                "concepts": _json_load_list(r.concepts_json),
                 "similarity": 0.5,
             }
             for r in rows

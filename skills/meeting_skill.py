@@ -72,13 +72,22 @@ class MeetingSkill(Skill):
             meeting_summary = m.summary
 
         if self.memory is not None and meeting_summary:
+            # Structured fields give Block D a tight render and let hybrid
+            # recall filter by attendee / decision concept.
+            attendee_list = [a.strip() for a in (attendees or "").split(",") if a.strip()]
+            decision_list = [d.strip() for d in (decisions or "").split("\n") if d.strip()]
+            title = f"Meeting {meeting_date[:10]}"
+            if attendee_list:
+                title += f" with {', '.join(attendee_list[:3])}"
             try:
                 await self.memory.remember(
                     f"Meeting on {meeting_date}: {meeting_summary}",
                     source="meeting",
+                    title=title,
+                    facts=decision_list or None,
+                    concepts=attendee_list or None,
                 )
             except Exception:
-                # Memory write is best-effort — never fail the meeting log on it
                 pass
 
         return {

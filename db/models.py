@@ -169,6 +169,12 @@ class SemanticMemory(Base):
     # SHA256(content)[:16] — checked before insert so a 60s dedup window
     # reinforces instead of creating duplicates. Indexed for O(1) lookup.
     content_hash = Column(String(16), index=True, nullable=True)
+    # Structured fields (all optional) — let callers attach a one-line title +
+    # typed facts/concepts lists so Block D can render tighter than a content
+    # blob and hybrid recall can filter/rank on more axes.
+    title = Column(String(200), default="")
+    facts_json = Column(Text, default="")        # JSON array of short bullets
+    concepts_json = Column(Text, default="")     # JSON array of entity/topic tags
 
 
 class Edge(Base):

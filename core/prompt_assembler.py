@@ -212,10 +212,9 @@ class PromptAssembler:
             parts.append("FOCUS SUBGRAPH:\n" + "\n".join(edge_lines))
 
         if memories:
-            mem_lines = [
-                f"  - [{m.get('source', 'mem')}] {m['content']}"
-                for m in memories[:8]
-            ]
+            mem_lines = []
+            for m in memories[:8]:
+                mem_lines.append(_format_memory_line(m))
             parts.append("RELEVANT MEMORIES:\n" + "\n".join(mem_lines))
 
         if plan.suggested_tools:
@@ -294,6 +293,21 @@ async def build_daily_context_lines(session_maker) -> list[str]:
                 lines.append(f"MEDDIC gap [{d.name}]: missing {', '.join(gaps)}")
 
     return lines
+
+
+def _format_memory_line(m: dict) -> str:
+    """Compact renderer — uses title + facts when structured, falls back to content.
+    Keeps each memory to ≤2 lines so Block D stays small on mobile-ready replies."""
+    source = m.get("source", "mem")
+    title = (m.get("title") or "").strip()
+    facts = m.get("facts") or []
+
+    if title and facts:
+        bullets = "; ".join(str(f) for f in facts[:3])
+        return f"  - [{source}] {title} — {bullets}"
+    if title:
+        return f"  - [{source}] {title}: {m.get('content', '')[:120]}"
+    return f"  - [{source}] {m.get('content', '')}"
 
 
 __all__ = [
