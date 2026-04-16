@@ -155,6 +155,9 @@ class SemanticMemory(Base):
     reinforcement_count = Column(Integer, default=1)
     last_reinforced_at = Column(DateTime(timezone=True), default=_now)
     source = Column(String, default="conversation")  # conversation | voice | email | meeting | system
+    # SHA256(content)[:16] — checked before insert so a 60s dedup window
+    # reinforces instead of creating duplicates. Indexed for O(1) lookup.
+    content_hash = Column(String(16), index=True, nullable=True)
 
 
 class Edge(Base):

@@ -5,10 +5,11 @@ CRM entities live in db.models and share the same Base; they're created here
 via `Base.metadata.create_all`.
 """
 import asyncio
+import hashlib
 import logging
 import math
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select, text
@@ -60,6 +61,19 @@ def _reinforcement_boost(count: int) -> float:
     if count is None or count < 1:
         return 0.0
     return 0.1 * math.log(count)
+
+
+# How long after an insert an identical content is treated as a reinforcement
+# instead of a new memory. Longer = more aggressive dedup; shorter = more
+# lenient for long-running agent sessions where the user might legit restate a fact.
+DEDUP_WINDOW_SECONDS = 60
+
+
+def _content_hash(content: str) -> str:
+    """SHA256 truncated to 16 hex chars. Same input → same hash across processes,
+    cheap to index, low enough collision risk for our scale (<1M memories)."""
+    normalized = (content or "").strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
 def _hybrid_score(
@@ -295,19 +309,48 @@ class MemoryStore:
     async def store_memory(self, content: str, source: str = "conversation") -> str:
         """Low-level write — embeds and inserts. Returns the memory id.
 
+        Dedup: if an identical memory was stored in the last DEDUP_WINDOW_SECONDS,
+        we bump its reinforcement_count + last_reinforced_at and return the
+        existing id instead of re-embedding + re-inserting. This halves DB
+        growth on tool-loop retries and is the key to reinforcement_count
+        meaningfully tracking "how often I've seen this fact."
+
         Does NOT extract entities. Use remember() for the full pipeline.
         """
+        hash_ = _content_hash(content)
+        now = datetime.now(timezone.utc)
+        dedup_cutoff = now - timedelta(seconds=DEDUP_WINDOW_SECONDS)
+
+        # Cheap dedup check BEFORE the embedding call — saves the embed cost
+        # on the hot path of tool-loop retries.
+        async with self.session_maker() as session:
+            existing = (
+                await session.execute(
+                    select(SemanticMemory)
+                    .where(
+                        SemanticMemory.content_hash == hash_,
+                        SemanticMemory.last_reinforced_at >= dedup_cutoff,
+                    )
+                    .order_by(SemanticMemory.last_reinforced_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                existing.reinforcement_count = (existing.reinforcement_count or 1) + 1
+                existing.last_reinforced_at = now
+                await session.commit()
+                return existing.id
+
         memory_id = str(uuid.uuid4())
         embedding = await self._embed(content)
-        now = datetime.now(timezone.utc)
         async with self.session_maker() as session:
             if getattr(self, "_vector_enabled", True):
                 await session.execute(
                     text(
                         "INSERT INTO semantic_memories "
                         "(id, content, embedding, timestamp, reinforcement_count, "
-                        " last_reinforced_at, source) "
-                        "VALUES (:id, :content, CAST(:embedding AS vector), :ts, 1, :ts, :source)"
+                        " last_reinforced_at, source, content_hash) "
+                        "VALUES (:id, :content, CAST(:embedding AS vector), :ts, 1, :ts, :source, :hash)"
                     ),
                     {
                         "id": memory_id,
@@ -315,6 +358,7 @@ class MemoryStore:
                         "embedding": str(embedding),
                         "ts": now,
                         "source": source,
+                        "hash": hash_,
                     },
                 )
             else:
@@ -323,10 +367,11 @@ class MemoryStore:
                     text(
                         "INSERT INTO semantic_memories "
                         "(id, content, timestamp, reinforcement_count, "
-                        " last_reinforced_at, source) "
-                        "VALUES (:id, :content, :ts, 1, :ts, :source)"
+                        " last_reinforced_at, source, content_hash) "
+                        "VALUES (:id, :content, :ts, 1, :ts, :source, :hash)"
                     ),
-                    {"id": memory_id, "content": content, "ts": now, "source": source},
+                    {"id": memory_id, "content": content, "ts": now,
+                     "source": source, "hash": hash_},
                 )
             await session.commit()
         return memory_id
