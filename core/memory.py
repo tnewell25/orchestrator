@@ -8,6 +8,7 @@ import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from fastembed import TextEmbedding
 from sqlalchemy import select, text
@@ -19,6 +20,11 @@ from ..db.models import (
     Fact,
     OAuthToken,
 )
+from .constants import EntityType
+
+if TYPE_CHECKING:
+    from .entity_extractor import EntityExtractor
+    from .graph import EntityRef
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +51,18 @@ class MemoryStore:
         logger.info(f"Loading embedding model: {embedding_model}")
         self._embedder = TextEmbedding(model_name=embedding_model)
         logger.info("Embedding model loaded")
+
+        # Optional — set via attach_extractor() post-init. When present, remember()
+        # auto-creates graph edges from new memories to mentioned entities.
+        self._extractor: "EntityExtractor | None" = None
+        # Whether to run the LLM-backed extraction in the background after the
+        # cheap substring pass. Disabled by default; flip on when a fast model is wired.
+        self._llm_extract_in_background: bool = False
+
+    def attach_extractor(self, extractor: "EntityExtractor", llm_background: bool = False):
+        """Wire the entity extractor in — called from main.py after construction."""
+        self._extractor = extractor
+        self._llm_extract_in_background = llm_background
 
     async def initialize(self):
         """Create all tables + enable pgvector extension + add embedding columns.
@@ -194,22 +212,77 @@ class MemoryStore:
         )
         return embeddings[0].tolist()
 
-    async def store_memory(self, content: str):
+    async def store_memory(self, content: str, source: str = "conversation") -> str:
+        """Low-level write — embeds and inserts. Returns the memory id.
+
+        Does NOT extract entities. Use remember() for the full pipeline.
+        """
+        memory_id = str(uuid.uuid4())
         embedding = await self._embed(content)
+        now = datetime.now(timezone.utc)
         async with self.session_maker() as session:
-            await session.execute(
-                text(
-                    "INSERT INTO semantic_memories (id, content, embedding, timestamp) "
-                    "VALUES (:id, :content, CAST(:embedding AS vector), :ts)"
-                ),
-                {
-                    "id": str(uuid.uuid4()),
-                    "content": content,
-                    "embedding": str(embedding),
-                    "ts": datetime.now(timezone.utc),
-                },
-            )
+            if getattr(self, "_vector_enabled", True):
+                await session.execute(
+                    text(
+                        "INSERT INTO semantic_memories "
+                        "(id, content, embedding, timestamp, reinforcement_count, "
+                        " last_reinforced_at, source) "
+                        "VALUES (:id, :content, CAST(:embedding AS vector), :ts, 1, :ts, :source)"
+                    ),
+                    {
+                        "id": memory_id,
+                        "content": content,
+                        "embedding": str(embedding),
+                        "ts": now,
+                        "source": source,
+                    },
+                )
+            else:
+                # Fallback when pgvector isn't installed (dev/test against sqlite)
+                await session.execute(
+                    text(
+                        "INSERT INTO semantic_memories "
+                        "(id, content, timestamp, reinforcement_count, "
+                        " last_reinforced_at, source) "
+                        "VALUES (:id, :content, :ts, 1, :ts, :source)"
+                    ),
+                    {"id": memory_id, "content": content, "ts": now, "source": source},
+                )
             await session.commit()
+        return memory_id
+
+    async def remember(
+        self,
+        content: str,
+        source: str = "conversation",
+        extract_entities: bool = True,
+    ) -> str:
+        """High-level write — store + extract entities + create graph edges.
+
+        Always runs the cheap substring extraction synchronously. Optionally
+        kicks off the LLM extractor in the background (set llm_background=True
+        when calling attach_extractor).
+
+        Returns the new memory id so callers can reference it.
+        """
+        memory_id = await self.store_memory(content, source=source)
+
+        if extract_entities and self._extractor is not None:
+            from .graph import EntityRef
+            source_ref = EntityRef(EntityType.MEMORY, memory_id)
+            try:
+                await self._extractor.extract(content, source_ref)
+            except Exception as e:
+                logger.warning("Substring extraction failed for memory %s: %s",
+                               memory_id, e)
+
+            if self._llm_extract_in_background:
+                try:
+                    await self._extractor.extract_llm_background(content, source_ref)
+                except Exception as e:
+                    logger.warning("LLM extraction scheduling failed: %s", e)
+
+        return memory_id
 
     async def recall(
         self, query: str, limit: int = 5, min_similarity: float = 0.3

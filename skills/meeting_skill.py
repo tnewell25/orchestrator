@@ -31,9 +31,12 @@ class MeetingSkill(Skill):
     name = "meeting"
     description = "Log meetings with attendees, summary, decisions, and transcript."
 
-    def __init__(self, session_maker):
+    def __init__(self, session_maker, memory=None):
         super().__init__()
         self.session_maker = session_maker
+        # Optional — when present, log() also writes the summary into semantic
+        # memory so it's recallable + entity-linked via the graph extractor.
+        self.memory = memory
 
     @tool(
         "Log a meeting. attendees is a comma-separated list of names. "
@@ -64,11 +67,25 @@ class MeetingSkill(Skill):
             s.add(m)
             await s.commit()
             await s.refresh(m)
-            return {
-                "id": m.id,
-                "date": str(m.date),
-                "summary": m.summary,
-            }
+            meeting_id = m.id
+            meeting_date = str(m.date)
+            meeting_summary = m.summary
+
+        if self.memory is not None and meeting_summary:
+            try:
+                await self.memory.remember(
+                    f"Meeting on {meeting_date}: {meeting_summary}",
+                    source="meeting",
+                )
+            except Exception:
+                # Memory write is best-effort — never fail the meeting log on it
+                pass
+
+        return {
+            "id": meeting_id,
+            "date": meeting_date,
+            "summary": meeting_summary,
+        }
 
     @tool("Get recent meetings for a deal, newest first.")
     async def recent(self, deal_id: str, limit: int = 10) -> list[dict]:

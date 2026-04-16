@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     ForeignKey,
     UniqueConstraint,
+    Index,
     Date,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -96,6 +97,50 @@ class SemanticMemory(Base):
     content = Column(Text, nullable=False)
     # embedding vector(384) added in MemoryStore.initialize()
     timestamp = Column(DateTime(timezone=True), default=_now)
+    # Hardens repeated facts: each time the same content (or near-duplicate) is
+    # seen, bump count + last_reinforced_at. Hybrid recall ranks high-count
+    # memories above one-off mentions.
+    reinforcement_count = Column(Integer, default=1)
+    last_reinforced_at = Column(DateTime(timezone=True), default=_now)
+    source = Column(String, default="conversation")  # conversation | voice | email | meeting | system
+
+
+class Edge(Base):
+    """Typed graph edge between any two entities — the cross-reference layer.
+
+    Direction is from→to. For symmetric semantics (e.g. "competes_with") insert
+    both directions or use the bidirectional traversal helper in core.graph.
+
+    A single (from, to, kind) tuple is unique; subsequent observations bump
+    reinforcement_count instead of inserting duplicates.
+    """
+
+    __tablename__ = "edges"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    from_type = Column(String, nullable=False)
+    from_id = Column(String, nullable=False)
+    to_type = Column(String, nullable=False)
+    to_id = Column(String, nullable=False)
+    kind = Column(String, nullable=False)
+
+    weight = Column(Float, default=1.0)        # ranking signal for retrieval
+    confidence = Column(Float, default=1.0)    # extractor's confidence
+    source = Column(String, default="auto_extract")  # auto_extract | manual | system | rule
+
+    reinforcement_count = Column(Integer, default=1)
+    last_reinforced_at = Column(DateTime(timezone=True), default=_now)
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "from_type", "from_id", "to_type", "to_id", "kind",
+            name="uq_edge_unique",
+        ),
+        Index("ix_edges_from", "from_type", "from_id"),
+        Index("ix_edges_to", "to_type", "to_id"),
+        Index("ix_edges_kind", "kind"),
+    )
 
 
 # ----------------------------------------------------------------------

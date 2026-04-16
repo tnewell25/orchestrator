@@ -10,6 +10,8 @@ from .config import get_settings
 from .core.agent import Agent
 from .core.audit import AuditLogger
 from .core.calendar_sync import CalendarAutoSync
+from .core.entity_extractor import EntityExtractor
+from .core.graph import GraphStore
 from .core.memory import MemoryStore
 from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
@@ -25,6 +27,7 @@ from .skills.deal_health_skill import DealHealthSkill
 from .skills.deal_skill import DealSkill
 from .skills.email_triage_skill import EmailTriageSkill
 from .skills.gmail_skill import GmailSkill
+from .skills.graph_skill import GraphSkill
 from .skills.job_skill import JobSkill
 from .skills.meeting_skill import MeetingSkill
 from .skills.proposal_skill import ProposalSkill
@@ -89,6 +92,34 @@ async def lifespan(app: FastAPI):
     await token_manager.initialize()
     logger.info("Token manager initialized (mode=%s)", token_manager.mode)
 
+    # 2b. Knowledge graph + write-time entity extractor.
+    # Built before skills because skills (future) may want to query the graph;
+    # extractor's LLM client uses the same auth path as the main agent.
+    graph = GraphStore(memory.session_maker)
+    extractor_client = None
+    if token_manager.access_token:
+        import anthropic
+        extractor_client = anthropic.AsyncAnthropic(
+            auth_token=token_manager.access_token,
+            default_headers={"anthropic-beta": "oauth-2025-04-20"},
+            max_retries=3, timeout=30.0,
+        )
+    elif token_manager.api_key or settings.anthropic_api_key:
+        import anthropic
+        extractor_client = anthropic.AsyncAnthropic(
+            api_key=token_manager.api_key or settings.anthropic_api_key,
+            max_retries=3, timeout=30.0,
+        )
+    extractor = EntityExtractor(
+        memory.session_maker, graph,
+        anthropic_client=extractor_client,
+        fast_model=settings.fast_model,
+    )
+    n_indexed = await extractor.refresh_index()
+    memory.attach_extractor(extractor, llm_background=bool(extractor_client))
+    logger.info("Entity extractor ready — %d names indexed (llm=%s)",
+                n_indexed, bool(extractor_client))
+
     # 3. Default chat id for reminders — first allowed user (owner)
     default_chat_id = (
         str(settings.allowed_user_ids[0]) if settings.allowed_user_ids else ""
@@ -105,8 +136,10 @@ async def lifespan(app: FastAPI):
         ContactSkill(sm),
         DealSkill(sm),
         TaskSkill(sm),
-        MeetingSkill(sm),
+        MeetingSkill(sm, memory=memory),
         BidSkill(sm, default_chat_id=default_chat_id),
+        # Knowledge graph queries
+        GraphSkill(sm, graph),
         # Productivity
         ReminderSkill(sm, default_chat_id=default_chat_id),
         BriefingSkill(sm),
