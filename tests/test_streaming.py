@@ -88,6 +88,8 @@ def _build_agent(stream_factory):
     agent._daily_cache = {}
     agent.compactor = None
     agent.action_gate = None
+    agent.event_bus = None
+    agent._session_tokens = {}
     agent.registry = ToolRegistry([])
     agent.tools = []
     agent.tool_map = {}
