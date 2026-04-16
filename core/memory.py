@@ -6,27 +6,77 @@ via `Base.metadata.create_all`.
 """
 import asyncio
 import logging
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from fastembed import TextEmbedding
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from ..db.models import (
     Base,
     Conversation,
+    Edge,
     Fact,
     OAuthToken,
+    SemanticMemory,
 )
-from .constants import EntityType
+from .constants import (
+    GRAPH_PROXIMITY_BONUS,
+    RECENCY_HALF_LIFE_DAYS,
+    EntityType,
+)
 
 if TYPE_CHECKING:
     from .entity_extractor import EntityExtractor
-    from .graph import EntityRef
+    from .graph import EntityRef, GraphStore
 
 logger = logging.getLogger(__name__)
+
+
+def _recency_factor(ts: datetime | None, now: datetime, half_life_days: float = RECENCY_HALF_LIFE_DAYS) -> float:
+    """Exponential decay in [~0.4, 1.0]. Floor at 0.4 so old memories never
+    drop to zero — they can still surface on strong vector match.
+
+    Sqlite returns naive datetimes; postgres returns aware. Normalize to UTC
+    so subtraction never crashes.
+    """
+    if ts is None:
+        return 0.4
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (now - ts).total_seconds() / 86400.0)
+    decay = 0.5 ** (age_days / half_life_days)
+    return 0.4 + 0.6 * decay
+
+
+def _reinforcement_boost(count: int) -> float:
+    """log(count) tail boost — small but separates 1-off mentions from facts
+    the user has reinforced 10+ times. Returns 0 for count=1, ~0.23 for count=10."""
+    if count is None or count < 1:
+        return 0.0
+    return 0.1 * math.log(count)
+
+
+def _hybrid_score(
+    vector_sim: float,
+    recency: float,
+    reinforcement_count: int,
+    proximity: float,
+) -> float:
+    """Combine the four signals into a single rank.
+
+    Scale: vector_sim ∈ [0,1] dominates. Other terms are small additions.
+    Tunable via constants.RECENCY_HALF_LIFE_DAYS / GRAPH_PROXIMITY_BONUS.
+    """
+    return (
+        vector_sim * recency
+        + GRAPH_PROXIMITY_BONUS * proximity
+        + _reinforcement_boost(reinforcement_count)
+    )
 
 
 class MemoryStore:
@@ -35,6 +85,7 @@ class MemoryStore:
         database_url: str,
         embedding_model: str = "BAAI/bge-small-en-v1.5",
         embedding_dim: int = 384,
+        embedder=None,
     ):
         # Normalize URL for asyncpg driver
         if database_url.startswith("postgres://"):
@@ -48,9 +99,15 @@ class MemoryStore:
         self.session_maker = async_sessionmaker(self.engine, expire_on_commit=False)
         self.embedding_dim = embedding_dim
 
-        logger.info(f"Loading embedding model: {embedding_model}")
-        self._embedder = TextEmbedding(model_name=embedding_model)
-        logger.info("Embedding model loaded")
+        # Embedder is injectable for tests. In prod, load the local fastembed
+        # model lazily — defer the heavy import until we actually need it.
+        if embedder is not None:
+            self._embedder = embedder
+        else:
+            from fastembed import TextEmbedding
+            logger.info(f"Loading embedding model: {embedding_model}")
+            self._embedder = TextEmbedding(model_name=embedding_model)
+            logger.info("Embedding model loaded")
 
         # Optional — set via attach_extractor() post-init. When present, remember()
         # auto-creates graph edges from new memories to mentioned entities.
@@ -210,7 +267,9 @@ class MemoryStore:
         embeddings = await loop.run_in_executor(
             None, lambda: list(self._embedder.embed([text_in]))
         )
-        return embeddings[0].tolist()
+        first = embeddings[0]
+        # fastembed returns numpy arrays; injected test embedders may return lists
+        return first.tolist() if hasattr(first, "tolist") else list(first)
 
     async def store_memory(self, content: str, source: str = "conversation") -> str:
         """Low-level write — embeds and inserts. Returns the memory id.
@@ -284,31 +343,181 @@ class MemoryStore:
 
         return memory_id
 
+    def attach_graph(self, graph: "GraphStore"):
+        """Wire in the graph store — required for proximity-aware recall.
+        Called from main.py after both objects exist."""
+        self._graph = graph
+
     async def recall(
-        self, query: str, limit: int = 5, min_similarity: float = 0.3
+        self,
+        query: str,
+        limit: int = 5,
+        min_similarity: float = 0.3,
+        focus_ref: "EntityRef | None" = None,
     ) -> list[dict]:
-        embedding = await self._embed(query)
+        """Backwards-compatible entry — delegates to recall_hybrid.
+
+        focus_ref is optional; without it, scoring is vector × recency × reinforcement.
+        With it, memories graph-proximate to the focus get a proximity bonus.
+        """
+        return await self.recall_hybrid(
+            query=query, focus_ref=focus_ref, limit=limit, min_similarity=min_similarity,
+        )
+
+    async def recall_hybrid(
+        self,
+        query: str,
+        focus_ref: "EntityRef | None" = None,
+        limit: int = 5,
+        candidate_pool: int | None = None,
+        min_similarity: float = 0.3,
+    ) -> list[dict]:
+        """Hybrid scoring: vector_sim × recency × reinforcement_boost + proximity.
+
+        Pulls a wider candidate pool from vector search (default 4×limit), then
+        re-ranks in Python using metadata + graph proximity to focus_ref.
+        """
+        candidate_pool = candidate_pool or max(limit * 4, 12)
+        candidates = await self._fetch_vector_candidates(
+            query, limit=candidate_pool, min_similarity=min_similarity,
+        )
+        if not candidates:
+            return []
+
+        # Build focus subgraph ONCE for O(1) proximity membership checks.
+        proximate_ids: set[str] = set()
+        if focus_ref is not None and getattr(self, "_graph", None) is not None:
+            try:
+                sg = await self._graph.subgraph(focus_ref, max_depth=2, max_nodes=80)
+                proximate_ids = {n.id for n in sg.nodes if n.type == EntityType.MEMORY}
+            except Exception as e:
+                logger.warning("Subgraph fetch for focus %s failed: %s", focus_ref, e)
+
+        now = datetime.now(timezone.utc)
+        scored = []
+        for c in candidates:
+            ts = c["timestamp"] if isinstance(c["timestamp"], datetime) else None
+            ref_ts = c["last_reinforced_at"] or ts
+            recency = _recency_factor(ref_ts, now)
+            proximity = 1.0 if c["id"] in proximate_ids else 0.0
+            score = _hybrid_score(
+                vector_sim=c["similarity"],
+                recency=recency,
+                reinforcement_count=c["reinforcement_count"],
+                proximity=proximity,
+            )
+            scored.append({
+                "id": c["id"],
+                "content": c["content"],
+                "timestamp": str(ts) if ts else "",
+                "source": c["source"],
+                "similarity": round(c["similarity"], 3),
+                "recency": round(recency, 3),
+                "reinforcement": c["reinforcement_count"],
+                "proximity": proximity,
+                "score": round(score, 3),
+            })
+
+        scored.sort(key=lambda r: r["score"], reverse=True)
+        return scored[:limit]
+
+    async def recall_for_entity(
+        self,
+        focus_ref: "EntityRef",
+        limit: int = 10,
+        max_depth: int = 2,
+    ) -> list[dict]:
+        """Graph-only recall: every memory connected to focus_ref within k hops,
+        ordered by recency. No vector search — useful when you want EVERYTHING
+        about a deal/contact regardless of how it was phrased.
+        """
+        if getattr(self, "_graph", None) is None:
+            logger.warning("recall_for_entity called without graph attached")
+            return []
+
+        sg = await self._graph.subgraph(focus_ref, max_depth=max_depth, max_nodes=200)
+        memory_ids = [n.id for n in sg.nodes if n.type == EntityType.MEMORY]
+        if not memory_ids:
+            return []
+
+        async with self.session_maker() as session:
+            rows = (
+                await session.execute(
+                    select(SemanticMemory)
+                    .where(SemanticMemory.id.in_(memory_ids))
+                    .order_by(SemanticMemory.last_reinforced_at.desc().nullslast())
+                    .limit(limit)
+                )
+            ).scalars().all()
+
+        now = datetime.now(timezone.utc)
+        return [
+            {
+                "id": r.id,
+                "content": r.content,
+                "timestamp": str(r.timestamp),
+                "source": r.source,
+                "reinforcement": r.reinforcement_count or 1,
+                "recency": round(_recency_factor(
+                    r.last_reinforced_at or r.timestamp, now
+                ), 3),
+                "via": "graph_proximity",
+            }
+            for r in rows
+        ]
+
+    async def _fetch_vector_candidates(
+        self, query: str, limit: int, min_similarity: float
+    ) -> list[dict]:
+        """Pulls top-N candidates by vector similarity + their hybrid metadata.
+
+        Pgvector path joins on the embedding column for similarity; sqlite
+        fallback returns recent memories ordered by reinforced_at (used by tests).
+        """
+        if getattr(self, "_vector_enabled", True):
+            embedding = await self._embed(query)
+            async with self.session_maker() as session:
+                result = await session.execute(
+                    text(
+                        "SELECT id, content, timestamp, source, "
+                        "       reinforcement_count, last_reinforced_at, "
+                        "       1 - (embedding <=> CAST(:embedding AS vector)) AS similarity "
+                        "FROM semantic_memories "
+                        "WHERE embedding IS NOT NULL "
+                        "  AND 1 - (embedding <=> CAST(:embedding AS vector)) > :min_sim "
+                        "ORDER BY embedding <=> CAST(:embedding AS vector) "
+                        "LIMIT :limit"
+                    ),
+                    {"embedding": str(embedding), "min_sim": min_similarity, "limit": limit},
+                )
+                return [
+                    {
+                        "id": r[0], "content": r[1], "timestamp": r[2], "source": r[3],
+                        "reinforcement_count": r[4] or 1,
+                        "last_reinforced_at": r[5],
+                        "similarity": float(r[6]),
+                    }
+                    for r in result.fetchall()
+                ]
+
+        # Sqlite fallback — no vector search, return all by recency with
+        # synthetic similarity = 0.5 so hybrid scoring still differentiates.
         async with self.session_maker() as session:
             result = await session.execute(
-                text(
-                    "SELECT content, timestamp, "
-                    "  1 - (embedding <=> CAST(:embedding AS vector)) AS similarity "
-                    "FROM semantic_memories "
-                    "WHERE embedding IS NOT NULL "
-                    "  AND 1 - (embedding <=> CAST(:embedding AS vector)) > :min_sim "
-                    "ORDER BY embedding <=> CAST(:embedding AS vector) "
-                    "LIMIT :limit"
-                ),
-                {"embedding": str(embedding), "min_sim": min_similarity, "limit": limit},
+                select(SemanticMemory)
+                .order_by(SemanticMemory.last_reinforced_at.desc().nullslast())
+                .limit(limit)
             )
-            return [
-                {
-                    "content": r[0],
-                    "timestamp": str(r[1]),
-                    "similarity": round(r[2], 3),
-                }
-                for r in result.fetchall()
-            ]
+            rows = result.scalars().all()
+        return [
+            {
+                "id": r.id, "content": r.content, "timestamp": r.timestamp, "source": r.source,
+                "reinforcement_count": r.reinforcement_count or 1,
+                "last_reinforced_at": r.last_reinforced_at,
+                "similarity": 0.5,
+            }
+            for r in rows
+        ]
 
     # -- Generic vector helpers (reused by battle_cards, proposal_precedents) --
 

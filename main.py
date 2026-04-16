@@ -117,6 +117,7 @@ async def lifespan(app: FastAPI):
     )
     n_indexed = await extractor.refresh_index()
     memory.attach_extractor(extractor, llm_background=bool(extractor_client))
+    memory.attach_graph(graph)  # enables hybrid recall with proximity
     logger.info("Entity extractor ready — %d names indexed (llm=%s)",
                 n_indexed, bool(extractor_client))
 
