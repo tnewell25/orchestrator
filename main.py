@@ -15,6 +15,7 @@ from .core.compactor import Compactor
 from .core.entity_extractor import EntityExtractor
 from .core.events import EventBus
 from .core.graph import GraphStore
+from .core.job_queue import JobQueue
 from .core.memory import MemoryStore
 from .core.pipeline_watcher import PipelineWatcher
 from .core.planner import Planner
@@ -172,10 +173,19 @@ async def lifespan(app: FastAPI):
     # 5. Agent — with planner if we have an LLM client; lazy tool loading
     # so the always-loaded prompt prefix stays small and cache-stable.
     planner = Planner(extractor_client, fast_model=settings.fast_model) if extractor_client else None
+    # Durable job queue + compactor wired through it so a crash mid-Haiku-call
+    # doesn't silently drop summarization work.
+    job_queue = JobQueue(memory.session_maker)
+    recovered = await job_queue.recover_stuck()
+    if recovered:
+        logger.warning("Reset %d orphaned background jobs from previous run", recovered)
     compactor = (
-        Compactor(memory.session_maker, extractor_client, fast_model=settings.fast_model)
-        if extractor_client else None
+        Compactor(
+            memory.session_maker, extractor_client,
+            fast_model=settings.fast_model, job_queue=job_queue,
+        ) if extractor_client else None
     )
+    app.state.job_queue = job_queue
     action_gate = ActionGate(memory.session_maker)
     # Create event bus BEFORE agent so cost alerts can publish from the first turn.
     event_bus = EventBus()

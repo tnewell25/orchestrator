@@ -16,6 +16,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from ..db.models import Conversation, SessionBrief
+from .job_queue import JobQueue
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class Compactor:
         fast_model: str = "claude-haiku-4-5-20251001",
         compact_threshold: int = 40,
         keep_recent: int = 15,
+        job_queue: JobQueue | None = None,
     ):
         self.sm = session_maker
         self.client = anthropic_client
@@ -55,6 +57,9 @@ class Compactor:
         self.compact_threshold = compact_threshold
         # Keep this many most-recent rows uncompacted (the active window)
         self.keep_recent = keep_recent
+        # Optional durability layer — when present, maybe_compact writes a
+        # processing row first so a crash mid-LLM-call doesn't drop the work.
+        self.job_queue = job_queue
 
     async def maybe_compact(
         self,
@@ -94,14 +99,43 @@ class Compactor:
         to_compact = rows[:n_to_compact]
         boundary_ts = to_compact[-1].timestamp
 
-        summary_text = await self._summarize(to_compact, focus_hint=focus_hint, intent=intent)
-        if not summary_text:
-            logger.warning("Compactor produced empty summary, skipping compaction")
-            return None
+        # Durability: enqueue a job row before doing the LLM call. If the
+        # server crashes after the LLM succeeds but before we persist the
+        # SessionBrief, recover_stuck() will reset + retry on next startup.
+        job = None
+        if self.job_queue is not None:
+            try:
+                job = await self.job_queue.enqueue("compaction", {
+                    "session_id": session_id,
+                    "focus_hint": focus_hint,
+                    "intent": intent,
+                    "row_count": n_to_compact,
+                })
+                # Claim immediately — we're about to process it in-line.
+                claimed = await self.job_queue.claim("compaction")
+                job = claimed or job
+            except Exception as e:
+                logger.warning("Job queue unavailable, proceeding without durability: %s", e)
+                job = None
 
-        return await self._write_brief_and_mark_compacted(
-            session_id, summary_text, to_compact, boundary_ts,
-        )
+        try:
+            summary_text = await self._summarize(to_compact, focus_hint=focus_hint, intent=intent)
+            if not summary_text:
+                logger.warning("Compactor produced empty summary, skipping compaction")
+                if job is not None and self.job_queue is not None:
+                    await self.job_queue.fail(job.id, "empty summary")
+                return None
+
+            brief = await self._write_brief_and_mark_compacted(
+                session_id, summary_text, to_compact, boundary_ts,
+            )
+            if job is not None and self.job_queue is not None:
+                await self.job_queue.confirm(job.id)
+            return brief
+        except Exception as e:
+            if job is not None and self.job_queue is not None:
+                await self.job_queue.fail(job.id, str(e)[:500])
+            raise
 
     async def _summarize(
         self,

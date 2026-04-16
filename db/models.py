@@ -52,6 +52,30 @@ class Conversation(Base):
     compacted_into = Column(String, ForeignKey("session_briefs.id", ondelete="SET NULL"), nullable=True, index=True)
 
 
+class BackgroundJob(Base):
+    """Durable queue for background work that must survive process restarts.
+
+    CLAIM-CONFIRM pattern: worker marks pending → processing, does the work,
+    marks completed. On startup, rows stuck in processing past stale_cutoff
+    (default 5min) reset to pending so a crashed worker doesn't lose the work.
+
+    Used by the Compactor (and future: extractor, watcher) so expensive LLM
+    calls aren't silently dropped when the server bounces mid-batch.
+    """
+
+    __tablename__ = "background_jobs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    job_type = Column(String, nullable=False, index=True)   # compaction | extraction | watcher | ...
+    payload = Column(Text, default="")                       # JSON-encoded args
+    # status: pending | processing | completed | failed | abandoned
+    status = Column(String, default="pending", index=True)
+    attempts = Column(Integer, default=0)
+    last_error = Column(String(500), default="")
+    created_at = Column(DateTime(timezone=True), default=_now, index=True)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
 class SessionBrief(Base):
     """A summary of older conversation turns, replacing them in the active
     window. Multiple briefs can exist per session; only the most recent
