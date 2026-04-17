@@ -1,24 +1,67 @@
-"""Dashboard read-only API — FastAPI router for the web frontend.
+"""Dashboard API — FastAPI router for the web frontend.
 
-All endpoints are GET, read-only, no auth (internal network). The dashboard
-consumes these to render pipeline, deals, contacts, activity, and analytics.
+GETs are read-only and unauth (internal network). Mutations (POST/PATCH) write
+through the same tables the bot uses, and emit an AuditLog row tagged
+tool_name="dashboard:<op>" so the agent's recall + Pipeline Watcher see when
+the user touched something in the UI vs. via chat.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 _sm = None  # set by mount_dashboard_api()
 
+DASH_SESSION = "dashboard"  # session_id stamped on dashboard-originated writes
+
 
 def mount_dashboard_api(app, session_maker):
     global _sm
     _sm = session_maker
     app.include_router(router)
+
+
+# ---- Write helpers -------------------------------------------------
+
+
+async def _audit(op: str, args: dict, status: str = "ok", summary: str = ""):
+    """Best-effort audit log so dashboard writes show up alongside bot tool calls.
+
+    Failure here must never block the user-visible mutation, hence the broad
+    except.
+    """
+    from ..db.models import AuditLog
+    try:
+        async with _sm() as s:
+            s.add(AuditLog(
+                tool_name=f"dashboard:{op}",
+                args_summary=json.dumps(args, default=str)[:500],
+                result_status=status,
+                result_summary=summary[:500],
+                session_id=DASH_SESSION,
+                safety="auto",
+            ))
+            await s.commit()
+    except Exception:
+        pass
+
+
+def _parse_date(s: str | None) -> date | None:
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 # ---- Pipeline (deals by stage) ------------------------------------
@@ -119,6 +162,7 @@ async def deal_detail(deal_id: str):
         "meddic_gaps": gaps,
         "stakeholders": [
             {
+                "id": st.id,
                 "contact_id": st.contact_id, "role": st.role,
                 "sentiment": st.sentiment, "influence": st.influence,
                 "name": contacts.get(st.contact_id, {}).get("name", ""),
@@ -263,3 +307,374 @@ async def analytics():
         "open_actions": open_actions or 0,
         "by_stage": by_stage,
     }
+
+
+# =====================================================================
+# WRITE endpoints — dashboard mutations. Round-trip into the same tables
+# the bot reads, so a stage moved on the kanban shows up next time the
+# agent asks "what stage is X in?". Each writes an AuditLog row tagged
+# dashboard:<op> for downstream visibility.
+# =====================================================================
+
+
+_DEAL_STAGES = {"prospect", "qualified", "proposal", "negotiation", "closed_won", "closed_lost"}
+_ACTION_STATUSES = {"open", "done", "snoozed"}
+_STAKE_ROLES = {"champion", "economic_buyer", "technical_buyer", "blocker", "coach", "user"}
+_STAKE_SENTIMENTS = {"supportive", "neutral", "opposed", "unknown"}
+_STAKE_INFLUENCES = {"low", "medium", "high"}
+_MEDDIC_FIELDS = {"metrics", "decision_criteria", "decision_process", "paper_process", "pain"}
+
+
+# ---- Deals --------------------------------------------------------
+
+
+class DealCreate(BaseModel):
+    name: str
+    company_id: str | None = None
+    stage: str = "prospect"
+    value_usd: float = 0.0
+    close_date: str | None = None
+    next_step: str = ""
+    notes: str = ""
+    competitors: str = ""
+
+
+@router.post("/deals")
+async def create_deal(body: DealCreate):
+    from ..db.models import Deal
+    if body.stage not in _DEAL_STAGES:
+        raise HTTPException(400, f"invalid stage: {body.stage}")
+    async with _sm() as s:
+        d = Deal(
+            name=body.name,
+            company_id=body.company_id or None,
+            stage=body.stage,
+            value_usd=body.value_usd,
+            close_date=_parse_date(body.close_date),
+            next_step=body.next_step,
+            notes=body.notes,
+            competitors=body.competitors,
+        )
+        s.add(d)
+        await s.commit()
+        await s.refresh(d)
+    await _audit("deal.create", body.model_dump(), summary=f"{d.id} {d.name}")
+    return {"id": d.id, "name": d.name, "stage": d.stage}
+
+
+class DealPatch(BaseModel):
+    name: str | None = None
+    stage: str | None = None
+    value_usd: float | None = None
+    close_date: str | None = None
+    next_step: str | None = None
+    notes: str | None = None              # replaces notes (use append endpoint to add)
+    notes_append: str | None = None       # append a paragraph to existing notes
+    competitors: str | None = None
+    company_id: str | None = None
+    economic_buyer_id: str | None = None
+    champion_id: str | None = None
+    metrics: str | None = None
+    decision_criteria: str | None = None
+    decision_process: str | None = None
+    paper_process: str | None = None
+    pain: str | None = None
+
+
+@router.patch("/deals/{deal_id}")
+async def patch_deal(deal_id: str, body: DealPatch):
+    from ..db.models import Deal
+    async with _sm() as s:
+        d = await s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+        if body.stage is not None:
+            if body.stage not in _DEAL_STAGES:
+                raise HTTPException(400, f"invalid stage: {body.stage}")
+            d.stage = body.stage
+        if body.name is not None:
+            d.name = body.name
+        if body.value_usd is not None:
+            d.value_usd = body.value_usd
+        if body.close_date is not None:
+            d.close_date = _parse_date(body.close_date)
+        if body.next_step is not None:
+            d.next_step = body.next_step
+        if body.notes is not None:
+            d.notes = body.notes
+        if body.notes_append:
+            d.notes = (d.notes + "\n\n" if d.notes else "") + body.notes_append
+        if body.competitors is not None:
+            d.competitors = body.competitors
+        if body.company_id is not None:
+            d.company_id = body.company_id or None
+        if body.economic_buyer_id is not None:
+            d.economic_buyer_id = body.economic_buyer_id or None
+        if body.champion_id is not None:
+            d.champion_id = body.champion_id or None
+        for f in _MEDDIC_FIELDS:
+            v = getattr(body, f)
+            if v is not None:
+                setattr(d, f, v)
+        await s.commit()
+    await _audit("deal.patch", {"id": deal_id, **body.model_dump(exclude_none=True)},
+                 summary=f"{deal_id}")
+    return {"id": deal_id, "updated": True}
+
+
+# ---- Action items -------------------------------------------------
+
+
+class ActionCreate(BaseModel):
+    description: str
+    due_date: str | None = None
+    contact_id: str | None = None
+    source: str = "dashboard"
+
+
+@router.post("/deals/{deal_id}/actions")
+async def create_action(deal_id: str, body: ActionCreate):
+    from ..db.models import ActionItem, Deal
+    async with _sm() as s:
+        d = await s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+        a = ActionItem(
+            deal_id=deal_id,
+            contact_id=body.contact_id or None,
+            description=body.description,
+            due_date=_parse_date(body.due_date),
+            source=body.source,
+        )
+        s.add(a)
+        await s.commit()
+        await s.refresh(a)
+    await _audit("action.create", {"deal_id": deal_id, **body.model_dump()},
+                 summary=f"{a.id} {body.description[:80]}")
+    return {
+        "id": a.id, "description": a.description, "status": a.status,
+        "due_date": str(a.due_date) if a.due_date else None, "source": a.source,
+    }
+
+
+class ActionPatch(BaseModel):
+    description: str | None = None
+    status: str | None = None
+    due_date: str | None = None
+
+
+@router.patch("/actions/{action_id}")
+async def patch_action(action_id: str, body: ActionPatch):
+    from ..db.models import ActionItem
+    from datetime import datetime as _dt, timezone as _tz
+    async with _sm() as s:
+        a = await s.get(ActionItem, action_id)
+        if not a:
+            raise HTTPException(404, "action not found")
+        if body.status is not None:
+            if body.status not in _ACTION_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            a.status = body.status
+            if body.status == "done" and not a.completed_at:
+                a.completed_at = _dt.now(_tz.utc)
+            if body.status == "open":
+                a.completed_at = None
+        if body.description is not None:
+            a.description = body.description
+        if body.due_date is not None:
+            a.due_date = _parse_date(body.due_date)
+        await s.commit()
+    await _audit("action.patch", {"id": action_id, **body.model_dump(exclude_none=True)},
+                 summary=f"{action_id}")
+    return {"id": action_id, "updated": True}
+
+
+# ---- Stakeholders -------------------------------------------------
+
+
+class StakeholderCreate(BaseModel):
+    contact_id: str
+    role: str
+    sentiment: str = "unknown"
+    influence: str = "medium"
+    notes: str = ""
+
+
+@router.post("/deals/{deal_id}/stakeholders")
+async def create_stakeholder(deal_id: str, body: StakeholderCreate):
+    from ..db.models import Deal, DealStakeholder
+    if body.role not in _STAKE_ROLES:
+        raise HTTPException(400, f"invalid role: {body.role}")
+    if body.sentiment not in _STAKE_SENTIMENTS:
+        raise HTTPException(400, f"invalid sentiment: {body.sentiment}")
+    if body.influence not in _STAKE_INFLUENCES:
+        raise HTTPException(400, f"invalid influence: {body.influence}")
+    async with _sm() as s:
+        d = await s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+        existing = (await s.execute(
+            select(DealStakeholder).where(
+                DealStakeholder.deal_id == deal_id,
+                DealStakeholder.contact_id == body.contact_id,
+                DealStakeholder.role == body.role,
+            )
+        )).scalar_one_or_none()
+        if existing:
+            existing.sentiment = body.sentiment
+            existing.influence = body.influence
+            if body.notes:
+                existing.notes = body.notes
+            sh_id = existing.id
+        else:
+            st = DealStakeholder(
+                deal_id=deal_id, contact_id=body.contact_id, role=body.role,
+                sentiment=body.sentiment, influence=body.influence, notes=body.notes,
+            )
+            s.add(st)
+            await s.commit()
+            await s.refresh(st)
+            sh_id = st.id
+            await s.commit()
+        await s.commit()
+    await _audit("stakeholder.create", {"deal_id": deal_id, **body.model_dump()},
+                 summary=f"{sh_id}")
+    return {"id": sh_id, "deal_id": deal_id}
+
+
+class StakeholderPatch(BaseModel):
+    sentiment: str | None = None
+    influence: str | None = None
+    role: str | None = None
+    notes: str | None = None
+
+
+@router.patch("/stakeholders/{stakeholder_id}")
+async def patch_stakeholder(stakeholder_id: str, body: StakeholderPatch):
+    from ..db.models import DealStakeholder
+    async with _sm() as s:
+        st = await s.get(DealStakeholder, stakeholder_id)
+        if not st:
+            raise HTTPException(404, "stakeholder not found")
+        if body.sentiment is not None:
+            if body.sentiment not in _STAKE_SENTIMENTS:
+                raise HTTPException(400, f"invalid sentiment: {body.sentiment}")
+            st.sentiment = body.sentiment
+        if body.influence is not None:
+            if body.influence not in _STAKE_INFLUENCES:
+                raise HTTPException(400, f"invalid influence: {body.influence}")
+            st.influence = body.influence
+        if body.role is not None:
+            if body.role not in _STAKE_ROLES:
+                raise HTTPException(400, f"invalid role: {body.role}")
+            st.role = body.role
+        if body.notes is not None:
+            st.notes = body.notes
+        await s.commit()
+    await _audit("stakeholder.patch",
+                 {"id": stakeholder_id, **body.model_dump(exclude_none=True)},
+                 summary=f"{stakeholder_id}")
+    return {"id": stakeholder_id, "updated": True}
+
+
+@router.delete("/stakeholders/{stakeholder_id}")
+async def delete_stakeholder(stakeholder_id: str):
+    from ..db.models import DealStakeholder
+    async with _sm() as s:
+        st = await s.get(DealStakeholder, stakeholder_id)
+        if not st:
+            raise HTTPException(404, "stakeholder not found")
+        await s.delete(st)
+        await s.commit()
+    await _audit("stakeholder.delete", {"id": stakeholder_id}, summary=stakeholder_id)
+    return {"id": stakeholder_id, "deleted": True}
+
+
+# ---- Contacts -----------------------------------------------------
+
+
+class ContactCreate(BaseModel):
+    name: str
+    company_id: str | None = None
+    title: str = ""
+    email: str = ""
+    phone: str = ""
+    linkedin: str = ""
+    personal_notes: str = ""
+
+
+@router.post("/contacts")
+async def create_contact(body: ContactCreate):
+    from ..db.models import Contact
+    async with _sm() as s:
+        c = Contact(
+            name=body.name, company_id=body.company_id or None,
+            title=body.title, email=body.email, phone=body.phone,
+            linkedin=body.linkedin, personal_notes=body.personal_notes,
+        )
+        s.add(c)
+        await s.commit()
+        await s.refresh(c)
+    await _audit("contact.create", body.model_dump(), summary=f"{c.id} {c.name}")
+    return {"id": c.id, "name": c.name}
+
+
+class ContactPatch(BaseModel):
+    name: str | None = None
+    title: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    linkedin: str | None = None
+    personal_notes: str | None = None
+    company_id: str | None = None
+
+
+@router.patch("/contacts/{contact_id}")
+async def patch_contact(contact_id: str, body: ContactPatch):
+    from ..db.models import Contact
+    async with _sm() as s:
+        c = await s.get(Contact, contact_id)
+        if not c:
+            raise HTTPException(404, "contact not found")
+        for field in ("name", "title", "email", "phone", "linkedin", "personal_notes"):
+            v = getattr(body, field)
+            if v is not None:
+                setattr(c, field, v)
+        if body.company_id is not None:
+            c.company_id = body.company_id or None
+        await s.commit()
+    await _audit("contact.patch", {"id": contact_id, **body.model_dump(exclude_none=True)},
+                 summary=contact_id)
+    return {"id": contact_id, "updated": True}
+
+
+# ---- Companies (used by contact/deal create dropdowns) ------------
+
+
+@router.get("/companies")
+async def list_companies(q: str = "", limit: int = 100):
+    from ..db.models import Company
+    async with _sm() as s:
+        query = select(Company).order_by(Company.name).limit(limit)
+        if q:
+            query = select(Company).where(Company.name.ilike(f"%{q}%")).limit(limit)
+        rows = (await s.execute(query)).scalars().all()
+    return {"companies": [{"id": r.id, "name": r.name, "industry": r.industry} for r in rows]}
+
+
+class CompanyCreate(BaseModel):
+    name: str
+    industry: str = ""
+    website: str = ""
+
+
+@router.post("/companies")
+async def create_company(body: CompanyCreate):
+    from ..db.models import Company
+    async with _sm() as s:
+        c = Company(name=body.name, industry=body.industry, website=body.website)
+        s.add(c)
+        await s.commit()
+        await s.refresh(c)
+    await _audit("company.create", body.model_dump(), summary=c.id)
+    return {"id": c.id, "name": c.name}
