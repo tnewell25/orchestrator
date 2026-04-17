@@ -22,6 +22,7 @@ from .core.planner import Planner
 from .core.rule_engine import ActionDispatcher, RuleEngine
 from .core.scheduler_tick import SchedulerTick
 from .core.strategy_fanout import StrategyFanout
+from .interfaces.dashboard_api import mount_dashboard_api
 from .interfaces.webhooks import build_webhook_router
 from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
@@ -231,7 +232,8 @@ async def lifespan(app: FastAPI):
     # into bus events. expected_token comes from settings if you want auth;
     # safer to use mutual TLS or a JWT verifier in front of this.
     app.include_router(build_webhook_router(event_bus))
-    logger.info("EventBus + rule engine ready, webhooks mounted at /webhooks")
+    mount_dashboard_api(app, sm)
+    logger.info("EventBus + rule engine ready, webhooks + dashboard API mounted")
 
     # 5c. Pipeline Watcher sub-agent — runs nightly via DAILY_SWEEP.
     if extractor_client is not None:
@@ -308,6 +310,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Orchestrator", lifespan=lifespan)
+
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
