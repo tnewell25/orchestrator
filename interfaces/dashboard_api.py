@@ -1733,3 +1733,43 @@ async def delete_compliance(item_id: str):
     return await _delete_by_id(ComplianceMatrixItem, item_id, "compliance.delete", "compliance item")
 
 
+# =====================================================================
+# PR4 — Chat history for the web chat panel.
+# The POST /chat endpoint already lives in main.py; this exposes recent
+# conversation rows so the dashboard can render the same back-and-forth
+# the user would see in Telegram for a given session.
+# =====================================================================
+
+
+@router.get("/chat/{session_id}")
+async def chat_history(session_id: str, limit: int = 50):
+    """Recent conversation turns for a session, oldest first.
+
+    Excludes rows that have been compacted into a SessionBrief (those
+    have already been summarized into the prompt and the raw text is
+    kept for audit, not re-display)."""
+    from ..db.models import Conversation
+    async with _sm() as s:
+        rows = (await s.execute(
+            select(Conversation)
+            .where(
+                Conversation.session_id == session_id,
+                Conversation.compacted_into.is_(None),
+            )
+            .order_by(Conversation.timestamp.desc())
+            .limit(limit)
+        )).scalars().all()
+    return {
+        "messages": [
+            {
+                "id": r.id,
+                "role": r.role,
+                "content": r.content,
+                "interface": r.interface,
+                "timestamp": str(r.timestamp),
+            }
+            for r in reversed(rows)
+        ],
+    }
+
+

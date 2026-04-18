@@ -522,6 +522,45 @@ async def test_compliance_bulk_import(client):
 
 
 @pytest.mark.asyncio
+async def test_chat_history_round_trip(client, session_maker):
+    """The web chat panel needs to render the same conversation history
+    the user would see in Telegram for a given session."""
+    from datetime import datetime, timezone, timedelta
+    from orchestrator.db.models import Conversation
+
+    sid = "web-thomas"
+    base = datetime.now(timezone.utc) - timedelta(minutes=10)
+    async with session_maker() as s:
+        for i, (role, content) in enumerate([
+            ("user", "what's the bosch deal at"),
+            ("assistant", "Bosch Forge is in proposal at $500k."),
+            ("user", "move it to negotiation"),
+            ("assistant", "Done. Moved to negotiation."),
+        ]):
+            s.add(Conversation(
+                session_id=sid, role=role, content=content,
+                interface="web",
+                timestamp=base + timedelta(seconds=i),
+            ))
+        # Add a compacted row that should NOT be returned
+        s.add(Conversation(
+            session_id=sid, role="user",
+            content="this was compacted",
+            timestamp=base - timedelta(hours=1),
+            compacted_into="some-brief-id",
+        ))
+        await s.commit()
+
+    resp = (await client.get(f"/api/dashboard/chat/{sid}")).json()
+    assert len(resp["messages"]) == 4
+    assert resp["messages"][0]["role"] == "user"
+    assert resp["messages"][0]["content"] == "what's the bosch deal at"
+    assert resp["messages"][3]["role"] == "assistant"
+    # Compacted row excluded
+    assert all("compacted" not in m["content"] for m in resp["messages"])
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include
