@@ -332,6 +332,11 @@ _STAKE_SENTIMENTS = {"supportive", "neutral", "opposed", "unknown"}
 _STAKE_INFLUENCES = {"low", "medium", "high"}
 _MEDDIC_FIELDS = {"metrics", "decision_criteria", "decision_process", "paper_process", "pain"}
 _BID_STAGES = {"evaluating", "in_progress", "submitted", "won", "lost", "withdrawn"}
+# Reminder statuses — extended beyond the bot-side default (pending|sent|cancelled|failed)
+# with `done` to capture user-acknowledged-from-the-dashboard. Snooze is a state
+# transition that bumps trigger_at + sets status back to pending so the
+# ReminderService picks it up again at the new time.
+_REMINDER_STATUSES = {"pending", "sent", "cancelled", "failed", "done"}
 
 
 # ---- Deals --------------------------------------------------------
@@ -1075,3 +1080,205 @@ async def delete_meeting(meeting_id: str):
 async def delete_bid(bid_id: str):
     from ..db.models import Bid
     return await _delete_by_id(Bid, bid_id, "bid.delete", "bid")
+
+
+# =====================================================================
+# Reminders + Inbox — turn the activity feed from a passive log into
+# an actionable surface. Bot-created reminders fire to Telegram, but
+# the user also needs to dismiss/resolve/snooze them from the UI.
+# =====================================================================
+
+
+class ReminderPatch(BaseModel):
+    status: str | None = None
+    message: str | None = None
+    trigger_at: str | None = None
+
+
+@router.patch("/reminders/{reminder_id}")
+async def patch_reminder(reminder_id: str, body: ReminderPatch):
+    from ..db.models import Reminder
+    async with _sm() as s:
+        r = await s.get(Reminder, reminder_id)
+        if not r:
+            raise HTTPException(404, "reminder not found")
+        if body.status is not None:
+            if body.status not in _REMINDER_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            r.status = body.status
+        if body.message is not None:
+            r.message = body.message
+        if body.trigger_at is not None:
+            r.trigger_at = _parse_dt(body.trigger_at)
+        await s.commit()
+    await _audit("reminder.patch", {"id": reminder_id, **body.model_dump(exclude_none=True)},
+                 summary=reminder_id)
+    return {"id": reminder_id, "updated": True}
+
+
+class ReminderSnooze(BaseModel):
+    hours: float = 24.0
+
+
+@router.post("/reminders/{reminder_id}/snooze")
+async def snooze_reminder(reminder_id: str, body: ReminderSnooze):
+    """Snooze pushes trigger_at forward and resets status to pending so the
+    ReminderService re-fires it at the new time. Cleaner than a separate
+    'snoozed' status because it reuses the existing pending pickup loop."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from ..db.models import Reminder
+    async with _sm() as s:
+        r = await s.get(Reminder, reminder_id)
+        if not r:
+            raise HTTPException(404, "reminder not found")
+        r.trigger_at = _dt.now(_tz.utc) + _td(hours=body.hours)
+        r.status = "pending"
+        r.sent_at = None
+        await s.commit()
+    await _audit("reminder.snooze", {"id": reminder_id, "hours": body.hours},
+                 summary=f"{reminder_id} +{body.hours}h")
+    return {"id": reminder_id, "trigger_at": str(r.trigger_at)}
+
+
+@router.delete("/reminders/{reminder_id}")
+async def delete_reminder(reminder_id: str):
+    from ..db.models import Reminder
+    return await _delete_by_id(Reminder, reminder_id, "reminder.delete", "reminder")
+
+
+# ---- Inbox — actionable items, deduped --------------------------------
+
+
+def _dedup_key(deal_id: str | None, message: str) -> str:
+    """Group reminders by deal + message-shape so the watcher firing the
+    same alert twice in the same window collapses to one inbox row."""
+    import hashlib
+    base = f"{deal_id or ''}|{(message or '').strip().lower()[:100]}"
+    return hashlib.sha256(base.encode()).hexdigest()[:16]
+
+
+@router.get("/inbox")
+async def inbox(limit: int = 50):
+    """One stream of things that need the user's attention right now:
+
+    - Reminders the bot has *sent* but the user hasn't yet acknowledged
+    - Reminders pending in the next 7 days (so user can plan)
+    - Open pending_actions (action-gate approval queue)
+    - Open action_items due within 7 days
+
+    Deduped by deal_id + message-hash within a 24h window.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from ..db.models import ActionItem, Deal, PendingAction, Reminder
+
+    now = _dt.now(_tz.utc)
+    horizon = now + _td(days=7)
+
+    async with _sm() as s:
+        # Reminders: sent (awaiting ack) OR pending (upcoming) OR snoozed-back
+        reminders = (await s.execute(
+            select(Reminder).where(
+                Reminder.status.in_(("pending", "sent")),
+                Reminder.trigger_at <= horizon,
+            ).order_by(Reminder.trigger_at.asc())
+        )).scalars().all()
+
+        # Pending agent-action approvals
+        pending_acts = (await s.execute(
+            select(PendingAction).where(PendingAction.status == "pending")
+            .order_by(PendingAction.created_at.desc())
+        )).scalars().all()
+
+        # Action items due in the next 7 days
+        actions_due = (await s.execute(
+            select(ActionItem).where(
+                ActionItem.status == "open",
+                ActionItem.due_date != None,  # noqa: E711
+                ActionItem.due_date <= horizon.date(),
+            ).order_by(ActionItem.due_date.asc())
+        )).scalars().all()
+
+        # Resolve deal names for context
+        deal_ids = (
+            {r.related_deal_id for r in reminders if r.related_deal_id}
+            | {p.related_deal_id for p in pending_acts if p.related_deal_id}
+            | {a.deal_id for a in actions_due if a.deal_id}
+        )
+        deals = {}
+        if deal_ids:
+            ds = (await s.execute(select(Deal).where(Deal.id.in_(deal_ids)))).scalars().all()
+            deals = {d.id: d.name for d in ds}
+
+    items: list[dict] = []
+    seen_keys: dict[str, dict] = {}
+
+    for r in reminders:
+        # Dedup: collapse near-identical reminders for the same deal — the
+        # Pipeline Watcher firing the same alert twice in 24h shouldn't
+        # mean two inbox rows the user has to dismiss separately.
+        key = _dedup_key(r.related_deal_id, r.message)
+        existing = seen_keys.get(key)
+        if existing:
+            existing["dup_count"] = existing.get("dup_count", 1) + 1
+            continue
+        item = {
+            "kind": "reminder",
+            "id": r.id,
+            "title": r.message[:200],
+            "status": r.status,
+            "trigger_at": str(r.trigger_at),
+            "is_overdue": r.status == "sent",       # bot fired, user hasn't acked
+            "deal_id": r.related_deal_id,
+            "deal_name": deals.get(r.related_deal_id) if r.related_deal_id else None,
+            "kind_detail": r.kind,
+            "dup_count": 1,
+        }
+        items.append(item)
+        seen_keys[key] = item
+
+    for p in pending_acts:
+        items.append({
+            "kind": "pending_action",
+            "id": p.id,
+            "title": p.summary or f"Approve {p.tool_name}",
+            "tool_name": p.tool_name,
+            "status": p.status,
+            "created_at": str(p.created_at),
+            "expires_at": str(p.expires_at) if p.expires_at else None,
+            "deal_id": p.related_deal_id,
+            "deal_name": deals.get(p.related_deal_id) if p.related_deal_id else None,
+        })
+
+    for a in actions_due:
+        items.append({
+            "kind": "action_item",
+            "id": a.id,
+            "title": a.description[:200],
+            "status": a.status,
+            "due_date": str(a.due_date) if a.due_date else None,
+            "source": a.source,
+            "deal_id": a.deal_id,
+            "deal_name": deals.get(a.deal_id) if a.deal_id else None,
+        })
+
+    # Sort: overdue/sent reminders first, then pending actions, then due-soon
+    # action items, then upcoming reminders. Inside each group, soonest first.
+    def _priority(it: dict) -> tuple[int, str]:
+        kind = it["kind"]
+        if kind == "reminder" and it.get("is_overdue"):
+            return (0, it.get("trigger_at", ""))
+        if kind == "pending_action":
+            return (1, it.get("created_at", ""))
+        if kind == "action_item":
+            return (2, it.get("due_date", "9999"))
+        return (3, it.get("trigger_at", ""))
+    items.sort(key=_priority)
+
+    return {"items": items[:limit], "counts": {
+        "reminders_overdue": sum(1 for i in items if i["kind"] == "reminder" and i.get("is_overdue")),
+        "pending_actions": sum(1 for i in items if i["kind"] == "pending_action"),
+        "actions_due": sum(1 for i in items if i["kind"] == "action_item"),
+        "reminders_upcoming": sum(1 for i in items if i["kind"] == "reminder" and not i.get("is_overdue")),
+    }}
+
+

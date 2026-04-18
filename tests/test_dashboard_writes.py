@@ -260,6 +260,134 @@ async def test_meeting_create_patch(client, session_maker):
 
 
 @pytest.mark.asyncio
+async def test_reminder_patch_done(client, session_maker):
+    """Marking a sent reminder as done removes it from the inbox."""
+    from datetime import datetime, timezone
+    from orchestrator.db.models import Reminder
+
+    async with session_maker() as s:
+        r = Reminder(
+            trigger_at=datetime.now(timezone.utc), message="Re-engage Bosch",
+            status="sent",
+        )
+        s.add(r)
+        await s.commit()
+        await s.refresh(r)
+        rid = r.id
+
+    inbox = (await client.get("/api/dashboard/inbox")).json()
+    assert any(it["id"] == rid for it in inbox["items"])
+
+    resp = await client.patch(f"/api/dashboard/reminders/{rid}", json={"status": "done"})
+    assert resp.status_code == 200
+
+    inbox = (await client.get("/api/dashboard/inbox")).json()
+    assert not any(it["id"] == rid for it in inbox["items"])
+
+
+@pytest.mark.asyncio
+async def test_reminder_snooze_pushes_trigger_forward(client, session_maker):
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.db.models import Reminder
+
+    async with session_maker() as s:
+        r = Reminder(
+            trigger_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            message="Old reminder", status="sent",
+        )
+        s.add(r)
+        await s.commit()
+        await s.refresh(r)
+        rid = r.id
+        original = r.trigger_at
+
+    resp = await client.post(f"/api/dashboard/reminders/{rid}/snooze", json={"hours": 48})
+    assert resp.status_code == 200
+
+    async with session_maker() as s:
+        rem = await s.get(Reminder, rid)
+        assert rem.status == "pending"
+        assert rem.sent_at is None
+        # Trigger pushed at least ~47h forward (allow tolerance for clock)
+        assert (rem.trigger_at - original).total_seconds() > 47 * 3600
+
+
+@pytest.mark.asyncio
+async def test_inbox_dedupes_duplicate_reminders(client, session_maker):
+    """The Pipeline Watcher firing two near-identical alerts for the same
+    deal in the same window should collapse to one inbox row with a
+    dup_count, not two rows the user has to dismiss separately."""
+    from datetime import datetime, timezone
+    from orchestrator.db.models import Deal, Reminder
+
+    async with session_maker() as s:
+        d = Deal(name="Bosch Pilot")
+        s.add(d)
+        await s.commit()
+        await s.refresh(d)
+        dup_text = "Re-engage Bosch — 465 days stale, critical MEDDIC gaps"
+        for _ in range(3):
+            s.add(Reminder(
+                trigger_at=datetime.now(timezone.utc),
+                message=dup_text, status="sent", related_deal_id=d.id,
+            ))
+        await s.commit()
+
+    inbox = (await client.get("/api/dashboard/inbox")).json()
+    bosch_items = [it for it in inbox["items"] if it.get("deal_id") == d.id]
+    assert len(bosch_items) == 1, f"expected 1 deduped item, got {len(bosch_items)}"
+    assert bosch_items[0]["dup_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_inbox_includes_action_items_due_soon(client, session_maker):
+    """Action items with a due_date in the next 7 days surface in the inbox
+    so the user doesn't have to dig into each deal page."""
+    from datetime import date, timedelta
+    from orchestrator.db.models import ActionItem, Deal
+
+    async with session_maker() as s:
+        d = Deal(name="Honeywell")
+        s.add(d)
+        await s.commit()
+        await s.refresh(d)
+        s.add(ActionItem(
+            deal_id=d.id, description="Send pricing",
+            due_date=date.today() + timedelta(days=2), status="open",
+        ))
+        # An item due far in the future should NOT appear
+        s.add(ActionItem(
+            deal_id=d.id, description="Q3 follow-up",
+            due_date=date.today() + timedelta(days=60), status="open",
+        ))
+        await s.commit()
+
+    inbox = (await client.get("/api/dashboard/inbox")).json()
+    descs = [it["title"] for it in inbox["items"] if it["kind"] == "action_item"]
+    assert "Send pricing" in descs
+    assert "Q3 follow-up" not in descs
+
+
+@pytest.mark.asyncio
+async def test_inbox_includes_pending_actions(client, session_maker):
+    from orchestrator.db.models import PendingAction
+
+    async with session_maker() as s:
+        p = PendingAction(
+            session_id="dashboard", tool_name="email.send",
+            tool_input='{"to":"x@y"}', summary="Send re-engage to Bosch champion",
+            status="pending",
+        )
+        s.add(p)
+        await s.commit()
+
+    inbox = (await client.get("/api/dashboard/inbox")).json()
+    pa = [it for it in inbox["items"] if it["kind"] == "pending_action"]
+    assert len(pa) == 1
+    assert pa[0]["tool_name"] == "email.send"
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include
