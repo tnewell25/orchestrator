@@ -319,10 +319,19 @@ async def analytics():
 
 _DEAL_STAGES = {"prospect", "qualified", "proposal", "negotiation", "closed_won", "closed_lost"}
 _ACTION_STATUSES = {"open", "done", "snoozed"}
-_STAKE_ROLES = {"champion", "economic_buyer", "technical_buyer", "blocker", "coach", "user"}
+# Industrial buying-committee taxonomy. The original SaaS-style 6 (champion/EB/TB/
+# blocker/coach/user) misses ~half of who shows up in a Bosch/Honeywell-class deal
+# review — OT-cyber gates, parent-co standards committees, and operations/maint
+# routinely kill deals that look healthy on a SaaS-shaped scorecard.
+_STAKE_ROLES = {
+    "champion", "economic_buyer", "technical_buyer", "blocker", "coach", "user",
+    "ot_cyber", "it_cyber", "operations", "maintenance",
+    "procurement", "legal", "finance", "parent_company_standards",
+}
 _STAKE_SENTIMENTS = {"supportive", "neutral", "opposed", "unknown"}
 _STAKE_INFLUENCES = {"low", "medium", "high"}
 _MEDDIC_FIELDS = {"metrics", "decision_criteria", "decision_process", "paper_process", "pain"}
+_BID_STAGES = {"evaluating", "in_progress", "submitted", "won", "lost", "withdrawn"}
 
 
 # ---- Deals --------------------------------------------------------
@@ -678,3 +687,391 @@ async def create_company(body: CompanyCreate):
         await s.refresh(c)
     await _audit("company.create", body.model_dump(), summary=c.id)
     return {"id": c.id, "name": c.name}
+
+
+class CompanyPatch(BaseModel):
+    name: str | None = None
+    industry: str | None = None
+    website: str | None = None
+    notes: str | None = None
+
+
+@router.patch("/companies/{company_id}")
+async def patch_company(company_id: str, body: CompanyPatch):
+    from ..db.models import Company
+    async with _sm() as s:
+        c = await s.get(Company, company_id)
+        if not c:
+            raise HTTPException(404, "company not found")
+        for f in ("name", "industry", "website", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(c, f, v)
+        await s.commit()
+    await _audit("company.patch", {"id": company_id, **body.model_dump(exclude_none=True)},
+                 summary=company_id)
+    return {"id": company_id, "updated": True}
+
+
+@router.get("/companies/{company_id}")
+async def company_detail(company_id: str):
+    """Account-centric rollup — every deal, contact, bid, and recent activity
+    for this company. Powers /companies/[id]."""
+    from ..db.models import ActionItem, Bid, Company, Contact, Deal, Meeting
+    async with _sm() as s:
+        c = await s.get(Company, company_id)
+        if not c:
+            raise HTTPException(404, "company not found")
+        deals = (await s.execute(
+            select(Deal).where(Deal.company_id == company_id).order_by(Deal.updated_at.desc())
+        )).scalars().all()
+        contacts = (await s.execute(
+            select(Contact).where(Contact.company_id == company_id).order_by(Contact.name)
+        )).scalars().all()
+        bids = (await s.execute(
+            select(Bid).where(Bid.company_id == company_id)
+            .order_by(Bid.submission_deadline.asc().nullslast())
+        )).scalars().all()
+        deal_ids = [d.id for d in deals]
+        recent_meetings = []
+        recent_actions = []
+        if deal_ids:
+            recent_meetings = (await s.execute(
+                select(Meeting).where(Meeting.deal_id.in_(deal_ids))
+                .order_by(Meeting.date.desc()).limit(10)
+            )).scalars().all()
+            recent_actions = (await s.execute(
+                select(ActionItem).where(ActionItem.deal_id.in_(deal_ids))
+                .order_by(ActionItem.created_at.desc()).limit(15)
+            )).scalars().all()
+
+    total_pipeline = sum(d.value_usd or 0 for d in deals if d.stage not in ("closed_won", "closed_lost"))
+    won_value = sum(d.value_usd or 0 for d in deals if d.stage == "closed_won")
+
+    return {
+        "company": {
+            "id": c.id, "name": c.name, "industry": c.industry,
+            "website": c.website, "notes": c.notes,
+        },
+        "stats": {
+            "deal_count": len(deals),
+            "active_pipeline_value": total_pipeline,
+            "won_value": won_value,
+            "contact_count": len(contacts),
+            "open_bid_count": sum(1 for b in bids if b.stage in ("evaluating", "in_progress")),
+        },
+        "deals": [
+            {"id": d.id, "name": d.name, "stage": d.stage,
+             "value_usd": d.value_usd or 0,
+             "close_date": str(d.close_date) if d.close_date else None,
+             "next_step": d.next_step or ""}
+            for d in deals
+        ],
+        "contacts": [
+            {"id": ct.id, "name": ct.name, "title": ct.title,
+             "email": ct.email, "phone": ct.phone,
+             "personal_notes": (ct.personal_notes or "")[:200]}
+            for ct in contacts
+        ],
+        "bids": [
+            {"id": b.id, "name": b.name, "stage": b.stage,
+             "value_usd": b.value_usd or 0,
+             "submission_deadline": b.submission_deadline.isoformat() if b.submission_deadline else None,
+             "deal_id": b.deal_id}
+            for b in bids
+        ],
+        "recent_meetings": [
+            {"id": m.id, "date": str(m.date), "summary": (m.summary or "")[:200], "deal_id": m.deal_id}
+            for m in recent_meetings
+        ],
+        "recent_actions": [
+            {"id": a.id, "description": a.description, "status": a.status,
+             "due_date": str(a.due_date) if a.due_date else None, "deal_id": a.deal_id}
+            for a in recent_actions
+        ],
+    }
+
+
+# ---- Bids (RFPs) — top-level industrial-sales surface --------------
+
+
+@router.get("/bids")
+async def list_bids(stage: str = "", limit: int = 100):
+    """All bids, ordered by submission deadline (urgent first). Optional
+    stage filter."""
+    from ..db.models import Bid, Company, Deal
+    async with _sm() as s:
+        q = select(Bid).order_by(Bid.submission_deadline.asc().nullslast()).limit(limit)
+        if stage:
+            if stage not in _BID_STAGES:
+                raise HTTPException(400, f"invalid stage: {stage}")
+            q = select(Bid).where(Bid.stage == stage).order_by(
+                Bid.submission_deadline.asc().nullslast()
+            ).limit(limit)
+        rows = (await s.execute(q)).scalars().all()
+        company_ids = {r.company_id for r in rows if r.company_id}
+        deal_ids = {r.deal_id for r in rows if r.deal_id}
+        companies = {}
+        if company_ids:
+            cs = (await s.execute(select(Company).where(Company.id.in_(company_ids)))).scalars().all()
+            companies = {c.id: c.name for c in cs}
+        deals = {}
+        if deal_ids:
+            ds = (await s.execute(select(Deal).where(Deal.id.in_(deal_ids)))).scalars().all()
+            deals = {d.id: d.name for d in ds}
+    return {
+        "bids": [
+            {
+                "id": r.id, "name": r.name, "stage": r.stage,
+                "value_usd": r.value_usd or 0,
+                "submission_deadline": r.submission_deadline.isoformat() if r.submission_deadline else None,
+                "qa_deadline": r.qa_deadline.isoformat() if r.qa_deadline else None,
+                "company_id": r.company_id, "company": companies.get(r.company_id, ""),
+                "deal_id": r.deal_id, "deal": deals.get(r.deal_id, ""),
+                "rfp_url": r.rfp_url or "",
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/bids/{bid_id}")
+async def bid_detail(bid_id: str):
+    from ..db.models import Bid, Company, Deal
+    async with _sm() as s:
+        b = await s.get(Bid, bid_id)
+        if not b:
+            raise HTTPException(404, "bid not found")
+        company_name = ""
+        deal_name = ""
+        if b.company_id:
+            c = await s.get(Company, b.company_id)
+            if c:
+                company_name = c.name
+        if b.deal_id:
+            d = await s.get(Deal, b.deal_id)
+            if d:
+                deal_name = d.name
+    return {
+        "bid": {
+            "id": b.id, "name": b.name, "stage": b.stage,
+            "value_usd": b.value_usd or 0,
+            "submission_deadline": b.submission_deadline.isoformat() if b.submission_deadline else None,
+            "qa_deadline": b.qa_deadline.isoformat() if b.qa_deadline else None,
+            "rfp_url": b.rfp_url or "",
+            "deliverables": b.deliverables or "",
+            "notes": b.notes or "",
+            "company_id": b.company_id, "company": company_name,
+            "deal_id": b.deal_id, "deal": deal_name,
+        },
+    }
+
+
+def _parse_dt(s: str | None):
+    """Parse an ISO datetime or YYYY-MM-DD into UTC-aware datetime."""
+    if not s:
+        return None
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        # ISO with timezone
+        d = _dt.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        # plain date
+        d = _dt.strptime(s, "%Y-%m-%d")
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_tz.utc)
+    return d
+
+
+class BidCreate(BaseModel):
+    name: str
+    company_id: str | None = None
+    deal_id: str | None = None
+    stage: str = "evaluating"
+    value_usd: float = 0.0
+    submission_deadline: str | None = None
+    qa_deadline: str | None = None
+    rfp_url: str = ""
+    deliverables: str = ""
+    notes: str = ""
+
+
+@router.post("/bids")
+async def create_bid(body: BidCreate):
+    from ..db.models import Bid
+    if body.stage not in _BID_STAGES:
+        raise HTTPException(400, f"invalid stage: {body.stage}")
+    async with _sm() as s:
+        b = Bid(
+            name=body.name,
+            company_id=body.company_id or None,
+            deal_id=body.deal_id or None,
+            stage=body.stage,
+            value_usd=body.value_usd,
+            submission_deadline=_parse_dt(body.submission_deadline),
+            qa_deadline=_parse_dt(body.qa_deadline),
+            rfp_url=body.rfp_url,
+            deliverables=body.deliverables,
+            notes=body.notes,
+        )
+        s.add(b)
+        await s.commit()
+        await s.refresh(b)
+    await _audit("bid.create", body.model_dump(), summary=f"{b.id} {b.name}")
+    return {"id": b.id, "name": b.name, "stage": b.stage}
+
+
+class BidPatch(BaseModel):
+    name: str | None = None
+    stage: str | None = None
+    value_usd: float | None = None
+    submission_deadline: str | None = None
+    qa_deadline: str | None = None
+    rfp_url: str | None = None
+    deliverables: str | None = None
+    notes: str | None = None
+    company_id: str | None = None
+    deal_id: str | None = None
+
+
+@router.patch("/bids/{bid_id}")
+async def patch_bid(bid_id: str, body: BidPatch):
+    from ..db.models import Bid
+    async with _sm() as s:
+        b = await s.get(Bid, bid_id)
+        if not b:
+            raise HTTPException(404, "bid not found")
+        if body.stage is not None:
+            if body.stage not in _BID_STAGES:
+                raise HTTPException(400, f"invalid stage: {body.stage}")
+            b.stage = body.stage
+        for f in ("name", "value_usd", "rfp_url", "deliverables", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(b, f, v)
+        if body.submission_deadline is not None:
+            b.submission_deadline = _parse_dt(body.submission_deadline)
+        if body.qa_deadline is not None:
+            b.qa_deadline = _parse_dt(body.qa_deadline)
+        if body.company_id is not None:
+            b.company_id = body.company_id or None
+        if body.deal_id is not None:
+            b.deal_id = body.deal_id or None
+        await s.commit()
+    await _audit("bid.patch", {"id": bid_id, **body.model_dump(exclude_none=True)}, summary=bid_id)
+    return {"id": bid_id, "updated": True}
+
+
+# ---- Meetings (CRUD parity — previously read-only) ---------------
+
+
+class MeetingCreate(BaseModel):
+    deal_id: str | None = None
+    date: str | None = None              # ISO datetime; defaults to now
+    attendees: str = ""
+    summary: str = ""
+    decisions: str = ""
+    transcript: str = ""
+
+
+@router.post("/deals/{deal_id}/meetings")
+async def create_meeting(deal_id: str, body: MeetingCreate):
+    from ..db.models import Deal, Meeting
+    async with _sm() as s:
+        d = await s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+        kwargs: dict = {
+            "deal_id": deal_id,
+            "attendees": body.attendees,
+            "summary": body.summary,
+            "decisions": body.decisions,
+            "transcript": body.transcript,
+        }
+        parsed_date = _parse_dt(body.date)
+        if parsed_date is not None:
+            kwargs["date"] = parsed_date
+        m = Meeting(**kwargs)
+        s.add(m)
+        await s.commit()
+        await s.refresh(m)
+    await _audit("meeting.create", {"deal_id": deal_id, **body.model_dump()},
+                 summary=f"{m.id}")
+    return {"id": m.id, "date": str(m.date)}
+
+
+class MeetingPatch(BaseModel):
+    date: str | None = None
+    attendees: str | None = None
+    summary: str | None = None
+    decisions: str | None = None
+    transcript: str | None = None
+
+
+@router.patch("/meetings/{meeting_id}")
+async def patch_meeting(meeting_id: str, body: MeetingPatch):
+    from ..db.models import Meeting
+    async with _sm() as s:
+        m = await s.get(Meeting, meeting_id)
+        if not m:
+            raise HTTPException(404, "meeting not found")
+        if body.date is not None:
+            m.date = _parse_dt(body.date)
+        for f in ("attendees", "summary", "decisions", "transcript"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(m, f, v)
+        await s.commit()
+    await _audit("meeting.patch", {"id": meeting_id, **body.model_dump(exclude_none=True)},
+                 summary=meeting_id)
+    return {"id": meeting_id, "updated": True}
+
+
+# ---- DELETE — universal CRUD parity ---------------------------------
+
+
+async def _delete_by_id(model_cls, entity_id: str, op: str, label: str):
+    async with _sm() as s:
+        obj = await s.get(model_cls, entity_id)
+        if not obj:
+            raise HTTPException(404, f"{label} not found")
+        await s.delete(obj)
+        await s.commit()
+    await _audit(op, {"id": entity_id}, summary=entity_id)
+    return {"id": entity_id, "deleted": True}
+
+
+@router.delete("/deals/{deal_id}")
+async def delete_deal(deal_id: str):
+    from ..db.models import Deal
+    return await _delete_by_id(Deal, deal_id, "deal.delete", "deal")
+
+
+@router.delete("/contacts/{contact_id}")
+async def delete_contact(contact_id: str):
+    from ..db.models import Contact
+    return await _delete_by_id(Contact, contact_id, "contact.delete", "contact")
+
+
+@router.delete("/companies/{company_id}")
+async def delete_company(company_id: str):
+    from ..db.models import Company
+    return await _delete_by_id(Company, company_id, "company.delete", "company")
+
+
+@router.delete("/actions/{action_id}")
+async def delete_action(action_id: str):
+    from ..db.models import ActionItem
+    return await _delete_by_id(ActionItem, action_id, "action.delete", "action")
+
+
+@router.delete("/meetings/{meeting_id}")
+async def delete_meeting(meeting_id: str):
+    from ..db.models import Meeting
+    return await _delete_by_id(Meeting, meeting_id, "meeting.delete", "meeting")
+
+
+@router.delete("/bids/{bid_id}")
+async def delete_bid(bid_id: str):
+    from ..db.models import Bid
+    return await _delete_by_id(Bid, bid_id, "bid.delete", "bid")

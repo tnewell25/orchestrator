@@ -122,3 +122,154 @@ async def test_audit_log_written(client, session_maker):
         )).scalars().all()
         assert len(rows) == 1
         assert rows[0].session_id == "dashboard"
+
+
+# ---------------------------------------------------------------------
+# PR1 — universal delete + companies detail + bids CRUD + meetings CRUD
+# + extended industrial stakeholder roles
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_delete_deal(client, session_maker):
+    from orchestrator.db.models import Deal
+    deal_id = (await client.post("/api/dashboard/deals", json={"name": "Doomed"})).json()["id"]
+    r = await client.delete(f"/api/dashboard/deals/{deal_id}")
+    assert r.status_code == 200
+    async with session_maker() as s:
+        assert await s.get(Deal, deal_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_404(client):
+    r = await client.delete("/api/dashboard/deals/does-not-exist")
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_each_entity(client):
+    """Smoke each delete route — ensures every model class resolves correctly."""
+    contact_id = (await client.post("/api/dashboard/contacts", json={"name": "X"})).json()["id"]
+    company_id = (await client.post("/api/dashboard/companies", json={"name": "Y"})).json()["id"]
+    deal_id = (await client.post("/api/dashboard/deals", json={"name": "Z"})).json()["id"]
+    action_id = (await client.post(f"/api/dashboard/deals/{deal_id}/actions",
+                                   json={"description": "do thing"})).json()["id"]
+    meeting_id = (await client.post(f"/api/dashboard/deals/{deal_id}/meetings",
+                                    json={"summary": "kickoff"})).json()["id"]
+    bid_id = (await client.post("/api/dashboard/bids", json={"name": "RFP-001"})).json()["id"]
+
+    for path in [
+        f"/api/dashboard/actions/{action_id}",
+        f"/api/dashboard/meetings/{meeting_id}",
+        f"/api/dashboard/bids/{bid_id}",
+        f"/api/dashboard/deals/{deal_id}",
+        f"/api/dashboard/contacts/{contact_id}",
+        f"/api/dashboard/companies/{company_id}",
+    ]:
+        r = await client.delete(path)
+        assert r.status_code == 200, f"{path} returned {r.status_code}"
+
+
+@pytest.mark.asyncio
+async def test_company_detail_rolls_up(client):
+    co = (await client.post("/api/dashboard/companies", json={"name": "Honeywell"})).json()
+    deal = (await client.post("/api/dashboard/deals", json={
+        "name": "DCS Migration", "company_id": co["id"], "value_usd": 750_000,
+    })).json()
+    await client.post("/api/dashboard/contacts",
+                      json={"name": "Lena", "company_id": co["id"]})
+    await client.post("/api/dashboard/bids",
+                      json={"name": "RFP-2026-Q2", "company_id": co["id"], "value_usd": 200_000})
+    await client.post(f"/api/dashboard/deals/{deal['id']}/actions",
+                      json={"description": "Send pricing"})
+
+    r = await client.get(f"/api/dashboard/companies/{co['id']}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["company"]["name"] == "Honeywell"
+    assert body["stats"]["deal_count"] == 1
+    assert body["stats"]["active_pipeline_value"] == 750_000
+    assert body["stats"]["contact_count"] == 1
+    assert body["stats"]["open_bid_count"] == 1
+    assert len(body["deals"]) == 1
+    assert len(body["bids"]) == 1
+    assert len(body["recent_actions"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_company_patch(client, session_maker):
+    from orchestrator.db.models import Company
+    co = (await client.post("/api/dashboard/companies", json={"name": "ACME"})).json()
+    r = await client.patch(f"/api/dashboard/companies/{co['id']}", json={
+        "industry": "Industrial Automation", "website": "acme.com",
+    })
+    assert r.status_code == 200
+    async with session_maker() as s:
+        c = await s.get(Company, co["id"])
+        assert c.industry == "Industrial Automation"
+        assert c.website == "acme.com"
+
+
+@pytest.mark.asyncio
+async def test_bid_create_list_patch(client):
+    co = (await client.post("/api/dashboard/companies", json={"name": "Bosch"})).json()
+    bid = (await client.post("/api/dashboard/bids", json={
+        "name": "Forge Line Controls", "company_id": co["id"],
+        "stage": "in_progress", "value_usd": 1_500_000,
+        "submission_deadline": "2026-05-01",
+        "deliverables": "Tech proposal, BOM, schedule",
+    })).json()
+
+    r = await client.get("/api/dashboard/bids")
+    assert r.status_code == 200
+    bids = r.json()["bids"]
+    assert any(b["id"] == bid["id"] and b["company"] == "Bosch" for b in bids)
+
+    r = await client.get("/api/dashboard/bids", params={"stage": "in_progress"})
+    assert all(b["stage"] == "in_progress" for b in r.json()["bids"])
+
+    r = await client.patch(f"/api/dashboard/bids/{bid['id']}", json={"stage": "submitted"})
+    assert r.status_code == 200
+
+    r = await client.get(f"/api/dashboard/bids/{bid['id']}")
+    assert r.json()["bid"]["stage"] == "submitted"
+    assert r.json()["bid"]["deliverables"] == "Tech proposal, BOM, schedule"
+
+
+@pytest.mark.asyncio
+async def test_bid_invalid_stage(client):
+    r = await client.post("/api/dashboard/bids", json={"name": "X", "stage": "invalid"})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_meeting_create_patch(client, session_maker):
+    from orchestrator.db.models import Meeting
+    deal = (await client.post("/api/dashboard/deals", json={"name": "X"})).json()
+    m = (await client.post(f"/api/dashboard/deals/{deal['id']}/meetings", json={
+        "attendees": "Lena, Brian", "summary": "Kickoff with controls team",
+    })).json()
+    r = await client.patch(f"/api/dashboard/meetings/{m['id']}", json={
+        "decisions": "Move to FAT in May",
+    })
+    assert r.status_code == 200
+    async with session_maker() as s:
+        meeting = await s.get(Meeting, m["id"])
+        assert meeting.decisions == "Move to FAT in May"
+        assert "Lena" in meeting.attendees
+
+
+@pytest.mark.asyncio
+async def test_industrial_stakeholder_roles_accepted(client):
+    """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
+    must be valid post-PR1 — buying committees in industrial sales include
+    these roles, and rejecting them would block the dashboard from modeling
+    real deals."""
+    deal = (await client.post("/api/dashboard/deals", json={"name": "X"})).json()
+    contact = (await client.post("/api/dashboard/contacts", json={"name": "C"})).json()
+    for role in ("ot_cyber", "parent_company_standards", "operations",
+                 "maintenance", "procurement", "legal", "finance", "it_cyber"):
+        r = await client.post(f"/api/dashboard/deals/{deal['id']}/stakeholders", json={
+            "contact_id": contact["id"], "role": role,
+        })
+        assert r.status_code == 200, f"role {role} rejected"
