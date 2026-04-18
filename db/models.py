@@ -303,6 +303,10 @@ class Deal(Base):
 
     id = Column(String, primary_key=True, default=_uuid)
     company_id = Column(String, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True)
+    # Site-level account planning — a Bosch deal lives at a specific plant,
+    # not at "Bosch corporate". Nullable for legacy deals + non-plant-scoped
+    # opportunities (corporate-wide framework agreements).
+    plant_id = Column(String, ForeignKey("plants.id", ondelete="SET NULL"), nullable=True, index=True)
     name = Column(String, nullable=False)
     # stage: prospect | qualified | proposal | negotiation | closed_won | closed_lost
     stage = Column(String, default="prospect", index=True)
@@ -390,6 +394,7 @@ class Bid(Base):
     name = Column(String, nullable=False)
     company_id = Column(String, ForeignKey("companies.id", ondelete="SET NULL"), nullable=True, index=True)
     deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True, index=True)
+    plant_id = Column(String, ForeignKey("plants.id", ondelete="SET NULL"), nullable=True, index=True)
 
     # Deadlines — all UTC
     submission_deadline = Column(DateTime(timezone=True), nullable=True, index=True)
@@ -686,6 +691,86 @@ class ProposalPrecedent(Base):
     tags = Column(Text, default="")  # comma-separated context tags
     source_deal_id = Column(String, ForeignKey("deals.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class Plant(Base):
+    """A physical site / plant belonging to a Company.
+
+    Industrial buyers have many plants per company (Bosch alone has 100+
+    sites globally), and a deal lives at a *plant*, not a company. A win at
+    Bosch Germany doesn't unlock Bosch Mexico — different decision-makers,
+    different installed base, different standards committee. Modeling Plant
+    as a first-class entity is the unlock for proper account planning.
+    """
+
+    __tablename__ = "plants"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    company_id = Column(String, ForeignKey("companies.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    name = Column(String, nullable=False, index=True)
+    site_address = Column(String, default="")
+    # site_type: refinery | chemical | power_gen | water_wastewater | manufacturing |
+    #            data_center | pharma | food_bev | mining | utility_substation | other
+    site_type = Column(String, default="other", index=True)
+    plant_manager_contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"),
+                                       nullable=True)
+    standards_notes = Column(Text, default="")  # parent-co standards committee context
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class Spec(Base):
+    """A standard / certification / spec entity. ATEX, IECEx, SIL ratings,
+    IEC 62443 zone classifications, NERC-CIP, NEC class/division, UL listings,
+    ITAR/EAR. The compliance-matrix line items reference these by ID so a
+    bid response can be scored, reused, and audited.
+    """
+
+    __tablename__ = "specs"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    code = Column(String, nullable=False, unique=True, index=True)   # e.g. "ATEX-Zone1", "SIL-2", "IEC-62443-3-2"
+    name = Column(String, nullable=False)
+    # family: hazardous_area | functional_safety | cybersecurity | electrical |
+    #         export_control | quality | environmental | other
+    family = Column(String, default="other", index=True)
+    scope = Column(Text, default="")           # what it covers
+    evidence_required = Column(Text, default="")  # what proof we usually need to produce
+    created_at = Column(DateTime(timezone=True), default=_now)
+
+
+class ComplianceMatrixItem(Base):
+    """One row of a bid's compliance matrix — RFP clause + our response.
+
+    The compliance matrix is the document procurement actually scores in
+    industrial RFPs. A single non-compliant line can disqualify a bid.
+    Tracking these as structured rows (not free-text in a Word doc) means
+    they're queryable, reusable across bids, and the agent can flag risk.
+    """
+
+    __tablename__ = "compliance_matrix_items"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    bid_id = Column(String, ForeignKey("bids.id", ondelete="CASCADE"),
+                    nullable=False, index=True)
+    # Source clause from the RFP — text + section pointer (e.g. "Section 4.2.1")
+    clause_section = Column(String, default="")
+    clause_text = Column(Text, nullable=False)
+    # Our response — what we say in the proposal
+    our_response = Column(Text, default="")
+    # status: compliant | partial | exception | not_applicable | unanswered
+    status = Column(String, default="unanswered", index=True)
+    # Comma-separated Spec.id values backing the response (ATEX cert,
+    # SIL rating, IEC 62443 evidence, etc.). Light denormalization beats
+    # a join table for a few specs per row.
+    spec_ids = Column(Text, default="")
+    notes = Column(Text, default="")
+    # Order within the matrix — preserves RFP section ordering when displayed
+    sort_order = Column(Integer, default=0, index=True)
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
 
 class WarrantyRecord(Base):

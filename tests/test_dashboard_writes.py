@@ -388,6 +388,140 @@ async def test_inbox_includes_pending_actions(client, session_maker):
 
 
 @pytest.mark.asyncio
+async def test_plant_crud_and_company_rollup(client, session_maker):
+    """Plants are first-class — a deal at Bosch Stuttgart is not the same
+    as a deal at Bosch Mexico. The company rollup must include plants so
+    account planning happens at the right level."""
+    from orchestrator.db.models import Plant
+
+    co = (await client.post("/api/dashboard/companies", json={"name": "Bosch"})).json()
+    p1 = (await client.post("/api/dashboard/plants", json={
+        "name": "Stuttgart Forge", "company_id": co["id"],
+        "site_address": "Stuttgart, DE", "site_type": "manufacturing",
+    })).json()
+    p2 = (await client.post("/api/dashboard/plants", json={
+        "name": "San Luis Potosi", "company_id": co["id"],
+        "site_type": "manufacturing",
+    })).json()
+
+    # Plant detail rolls up deals + bids at this site
+    deal = (await client.post("/api/dashboard/deals", json={
+        "name": "Stuttgart DCS upgrade", "company_id": co["id"],
+        "plant_id": p1["id"], "value_usd": 1_200_000,
+    })).json()
+    detail = (await client.get(f"/api/dashboard/plants/{p1['id']}")).json()
+    assert detail["plant"]["name"] == "Stuttgart Forge"
+    assert len(detail["deals"]) == 1
+    assert detail["deals"][0]["id"] == deal["id"]
+
+    # Company rollup includes plants
+    co_detail = (await client.get(f"/api/dashboard/companies/{co['id']}")).json()
+    assert co_detail["stats"]["plant_count"] == 2
+    plant_names = {p["name"] for p in co_detail["plants"]}
+    assert plant_names == {"Stuttgart Forge", "San Luis Potosi"}
+
+    # Patch + delete
+    await client.patch(f"/api/dashboard/plants/{p2['id']}", json={"site_type": "chemical"})
+    async with session_maker() as s:
+        plant = await s.get(Plant, p2["id"])
+        assert plant.site_type == "chemical"
+
+    r = await client.delete(f"/api/dashboard/plants/{p2['id']}")
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_invalid_site_type_rejected(client):
+    co = (await client.post("/api/dashboard/companies", json={"name": "X"})).json()
+    r = await client.post("/api/dashboard/plants", json={
+        "name": "Bad", "company_id": co["id"], "site_type": "invalid",
+    })
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_specs_library(client):
+    sp = (await client.post("/api/dashboard/specs", json={
+        "code": "ATEX-Zone1", "name": "ATEX Zone 1 (gas, intermittent)",
+        "family": "hazardous_area",
+        "scope": "Equipment for areas where explosive atmospheres likely occur in normal operation",
+    })).json()
+    assert sp["code"] == "ATEX-Zone1"
+
+    # Duplicate code rejected
+    dup = await client.post("/api/dashboard/specs", json={
+        "code": "ATEX-Zone1", "name": "dup",
+    })
+    assert dup.status_code == 409
+
+    # Family filter
+    r = (await client.get("/api/dashboard/specs", params={"family": "hazardous_area"})).json()
+    codes = [s["code"] for s in r["specs"]]
+    assert "ATEX-Zone1" in codes
+
+
+@pytest.mark.asyncio
+async def test_compliance_matrix_lifecycle(client, session_maker):
+    """The compliance matrix is the bid-scoring document. Procurement uses
+    it to disqualify, so structured tracking of every clause is the moat."""
+    from orchestrator.db.models import ComplianceMatrixItem
+
+    bid = (await client.post("/api/dashboard/bids", json={"name": "RFP-2026-Q2"})).json()
+    spec = (await client.post("/api/dashboard/specs", json={
+        "code": "SIL-2", "name": "Safety Integrity Level 2",
+        "family": "functional_safety",
+    })).json()
+
+    item = (await client.post(f"/api/dashboard/bids/{bid['id']}/compliance", json={
+        "clause_section": "4.2.1",
+        "clause_text": "All field-mounted equipment in hazardous areas must be ATEX certified.",
+        "our_response": "All instruments ATEX Zone 2 certified. Cert numbers in Appendix C.",
+        "status": "compliant",
+        "spec_ids": [spec["id"]],
+    })).json()
+
+    listed = (await client.get(f"/api/dashboard/bids/{bid['id']}/compliance")).json()
+    assert listed["total"] == 1
+    assert listed["summary"]["compliant"] == 1
+    assert listed["items"][0]["spec_ids"] == [spec["id"]]
+
+    # Patch status to exception (the row procurement will probe in clarification)
+    await client.patch(f"/api/dashboard/compliance/{item['id']}", json={
+        "status": "exception",
+        "notes": "We propose Zone 2 alternative; vendor cert pending.",
+    })
+    async with session_maker() as s:
+        row = await s.get(ComplianceMatrixItem, item["id"])
+        assert row.status == "exception"
+        assert "Zone 2 alternative" in row.notes
+
+    # Delete
+    r = await client.delete(f"/api/dashboard/compliance/{item['id']}")
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_compliance_bulk_import(client):
+    """Bulk-paste mode: paste an RFP's clause list, get N rows created
+    with section markers parsed out."""
+    bid = (await client.post("/api/dashboard/bids", json={"name": "BulkBid"})).json()
+    text = """
+    4.2.1 All field-mounted equipment must be ATEX certified.
+    4.2.2 SIL-2 rating required for safety-critical loops.
+    4.3.1 IEC 62443-3-2 zone & conduit drawing must be provided.
+    Vendor must hold ISO 9001 certification.
+    """
+    r = await client.post(f"/api/dashboard/bids/{bid['id']}/compliance/bulk", json={"text": text})
+    assert r.status_code == 200
+    assert r.json()["created"] == 4
+
+    listed = (await client.get(f"/api/dashboard/bids/{bid['id']}/compliance")).json()
+    sections = [it["clause_section"] for it in listed["items"]]
+    assert "4.2.1" in sections
+    assert "4.3.1" in sections
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include

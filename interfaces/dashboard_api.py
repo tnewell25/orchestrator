@@ -152,11 +152,29 @@ async def deal_detail(deal_id: str):
         }
         gaps = [k for k, v in meddic.items() if not v]
 
+    # Resolve plant + company for header context
+    from ..db.models import Plant
+    plant_name = ""
+    company_name = ""
+    if d.plant_id:
+        async with _sm() as s2:
+            pl = await s2.get(Plant, d.plant_id)
+            if pl:
+                plant_name = pl.name
+    if d.company_id:
+        from ..db.models import Company
+        async with _sm() as s2:
+            co = await s2.get(Company, d.company_id)
+            if co:
+                company_name = co.name
+
     return {
         "deal": {
             "id": d.id, "name": d.name, "stage": d.stage,
             "value_usd": d.value_usd, "close_date": str(d.close_date) if d.close_date else None,
             "next_step": d.next_step, "notes": d.notes, "competitors": d.competitors,
+            "company_id": d.company_id, "company": company_name,
+            "plant_id": d.plant_id, "plant": plant_name,
         },
         "meddic": meddic,
         "meddic_gaps": gaps,
@@ -337,6 +355,15 @@ _BID_STAGES = {"evaluating", "in_progress", "submitted", "won", "lost", "withdra
 # transition that bumps trigger_at + sets status back to pending so the
 # ReminderService picks it up again at the new time.
 _REMINDER_STATUSES = {"pending", "sent", "cancelled", "failed", "done"}
+_PLANT_SITE_TYPES = {
+    "refinery", "chemical", "power_gen", "water_wastewater", "manufacturing",
+    "data_center", "pharma", "food_bev", "mining", "utility_substation", "other",
+}
+_SPEC_FAMILIES = {
+    "hazardous_area", "functional_safety", "cybersecurity", "electrical",
+    "export_control", "quality", "environmental", "other",
+}
+_COMPLIANCE_STATUSES = {"compliant", "partial", "exception", "not_applicable", "unanswered"}
 
 
 # ---- Deals --------------------------------------------------------
@@ -345,6 +372,7 @@ _REMINDER_STATUSES = {"pending", "sent", "cancelled", "failed", "done"}
 class DealCreate(BaseModel):
     name: str
     company_id: str | None = None
+    plant_id: str | None = None
     stage: str = "prospect"
     value_usd: float = 0.0
     close_date: str | None = None
@@ -362,6 +390,7 @@ async def create_deal(body: DealCreate):
         d = Deal(
             name=body.name,
             company_id=body.company_id or None,
+            plant_id=body.plant_id or None,
             stage=body.stage,
             value_usd=body.value_usd,
             close_date=_parse_date(body.close_date),
@@ -386,6 +415,7 @@ class DealPatch(BaseModel):
     notes_append: str | None = None       # append a paragraph to existing notes
     competitors: str | None = None
     company_id: str | None = None
+    plant_id: str | None = None
     economic_buyer_id: str | None = None
     champion_id: str | None = None
     metrics: str | None = None
@@ -422,6 +452,8 @@ async def patch_deal(deal_id: str, body: DealPatch):
             d.competitors = body.competitors
         if body.company_id is not None:
             d.company_id = body.company_id or None
+        if body.plant_id is not None:
+            d.plant_id = body.plant_id or None
         if body.economic_buyer_id is not None:
             d.economic_buyer_id = body.economic_buyer_id or None
         if body.champion_id is not None:
@@ -720,9 +752,9 @@ async def patch_company(company_id: str, body: CompanyPatch):
 
 @router.get("/companies/{company_id}")
 async def company_detail(company_id: str):
-    """Account-centric rollup — every deal, contact, bid, and recent activity
-    for this company. Powers /companies/[id]."""
-    from ..db.models import ActionItem, Bid, Company, Contact, Deal, Meeting
+    """Account-centric rollup — every deal, contact, bid, plant, and recent
+    activity for this company. Powers /companies/[id]."""
+    from ..db.models import ActionItem, Bid, Company, Contact, Deal, Meeting, Plant
     async with _sm() as s:
         c = await s.get(Company, company_id)
         if not c:
@@ -736,6 +768,9 @@ async def company_detail(company_id: str):
         bids = (await s.execute(
             select(Bid).where(Bid.company_id == company_id)
             .order_by(Bid.submission_deadline.asc().nullslast())
+        )).scalars().all()
+        plants = (await s.execute(
+            select(Plant).where(Plant.company_id == company_id).order_by(Plant.name)
         )).scalars().all()
         deal_ids = [d.id for d in deals]
         recent_meetings = []
@@ -764,7 +799,14 @@ async def company_detail(company_id: str):
             "won_value": won_value,
             "contact_count": len(contacts),
             "open_bid_count": sum(1 for b in bids if b.stage in ("evaluating", "in_progress")),
+            "plant_count": len(plants),
         },
+        "plants": [
+            {"id": p.id, "name": p.name,
+             "site_address": p.site_address or "",
+             "site_type": p.site_type or "other"}
+            for p in plants
+        ],
         "deals": [
             {"id": d.id, "name": d.name, "stage": d.stage,
              "value_usd": d.value_usd or 0,
@@ -857,6 +899,13 @@ async def bid_detail(bid_id: str):
             d = await s.get(Deal, b.deal_id)
             if d:
                 deal_name = d.name
+    plant_name = ""
+    if b.plant_id:
+        from ..db.models import Plant
+        async with _sm() as s:
+            pl = await s.get(Plant, b.plant_id)
+            if pl:
+                plant_name = pl.name
     return {
         "bid": {
             "id": b.id, "name": b.name, "stage": b.stage,
@@ -868,6 +917,7 @@ async def bid_detail(bid_id: str):
             "notes": b.notes or "",
             "company_id": b.company_id, "company": company_name,
             "deal_id": b.deal_id, "deal": deal_name,
+            "plant_id": b.plant_id, "plant": plant_name,
         },
     }
 
@@ -892,6 +942,7 @@ class BidCreate(BaseModel):
     name: str
     company_id: str | None = None
     deal_id: str | None = None
+    plant_id: str | None = None
     stage: str = "evaluating"
     value_usd: float = 0.0
     submission_deadline: str | None = None
@@ -911,6 +962,7 @@ async def create_bid(body: BidCreate):
             name=body.name,
             company_id=body.company_id or None,
             deal_id=body.deal_id or None,
+            plant_id=body.plant_id or None,
             stage=body.stage,
             value_usd=body.value_usd,
             submission_deadline=_parse_dt(body.submission_deadline),
@@ -937,6 +989,7 @@ class BidPatch(BaseModel):
     notes: str | None = None
     company_id: str | None = None
     deal_id: str | None = None
+    plant_id: str | None = None
 
 
 @router.patch("/bids/{bid_id}")
@@ -962,6 +1015,8 @@ async def patch_bid(bid_id: str, body: BidPatch):
             b.company_id = body.company_id or None
         if body.deal_id is not None:
             b.deal_id = body.deal_id or None
+        if body.plant_id is not None:
+            b.plant_id = body.plant_id or None
         await s.commit()
     await _audit("bid.patch", {"id": bid_id, **body.model_dump(exclude_none=True)}, summary=bid_id)
     return {"id": bid_id, "updated": True}
@@ -1280,5 +1335,401 @@ async def inbox(limit: int = 50):
         "actions_due": sum(1 for i in items if i["kind"] == "action_item"),
         "reminders_upcoming": sum(1 for i in items if i["kind"] == "reminder" and not i.get("is_overdue")),
     }}
+
+
+# =====================================================================
+# PR3 — industrial data model: Plants, Specs, Compliance Matrix
+# =====================================================================
+
+
+# ---- Plants -------------------------------------------------------
+
+
+@router.get("/plants")
+async def list_plants(company_id: str = "", q: str = "", limit: int = 100):
+    from ..db.models import Company, Plant
+    async with _sm() as s:
+        q_stmt = select(Plant).order_by(Plant.name).limit(limit)
+        if company_id:
+            q_stmt = select(Plant).where(Plant.company_id == company_id).order_by(Plant.name)
+        elif q:
+            q_stmt = select(Plant).where(Plant.name.ilike(f"%{q}%")).limit(limit)
+        rows = (await s.execute(q_stmt)).scalars().all()
+        company_ids = {r.company_id for r in rows if r.company_id}
+        companies = {}
+        if company_ids:
+            cs = (await s.execute(select(Company).where(Company.id.in_(company_ids)))).scalars().all()
+            companies = {c.id: c.name for c in cs}
+    return {
+        "plants": [
+            {
+                "id": r.id, "name": r.name,
+                "company_id": r.company_id, "company": companies.get(r.company_id, ""),
+                "site_address": r.site_address or "",
+                "site_type": r.site_type or "other",
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/plants/{plant_id}")
+async def plant_detail(plant_id: str):
+    from ..db.models import Bid, Company, Contact, Deal, Plant
+    async with _sm() as s:
+        p = await s.get(Plant, plant_id)
+        if not p:
+            raise HTTPException(404, "plant not found")
+        company = None
+        if p.company_id:
+            c = await s.get(Company, p.company_id)
+            if c:
+                company = {"id": c.id, "name": c.name}
+        deals = (await s.execute(
+            select(Deal).where(Deal.plant_id == plant_id).order_by(Deal.updated_at.desc())
+        )).scalars().all()
+        bids = (await s.execute(
+            select(Bid).where(Bid.plant_id == plant_id)
+            .order_by(Bid.submission_deadline.asc().nullslast())
+        )).scalars().all()
+        manager = None
+        if p.plant_manager_contact_id:
+            mc = await s.get(Contact, p.plant_manager_contact_id)
+            if mc:
+                manager = {"id": mc.id, "name": mc.name, "title": mc.title, "email": mc.email}
+
+    return {
+        "plant": {
+            "id": p.id, "name": p.name,
+            "site_address": p.site_address or "",
+            "site_type": p.site_type or "other",
+            "standards_notes": p.standards_notes or "",
+            "notes": p.notes or "",
+            "company": company,
+            "plant_manager": manager,
+        },
+        "deals": [
+            {"id": d.id, "name": d.name, "stage": d.stage,
+             "value_usd": d.value_usd or 0,
+             "next_step": d.next_step or "",
+             "close_date": str(d.close_date) if d.close_date else None}
+            for d in deals
+        ],
+        "bids": [
+            {"id": b.id, "name": b.name, "stage": b.stage,
+             "value_usd": b.value_usd or 0,
+             "submission_deadline": b.submission_deadline.isoformat() if b.submission_deadline else None}
+            for b in bids
+        ],
+    }
+
+
+class PlantCreate(BaseModel):
+    name: str
+    company_id: str
+    site_address: str = ""
+    site_type: str = "other"
+    plant_manager_contact_id: str | None = None
+    standards_notes: str = ""
+    notes: str = ""
+
+
+@router.post("/plants")
+async def create_plant(body: PlantCreate):
+    from ..db.models import Company, Plant
+    if body.site_type not in _PLANT_SITE_TYPES:
+        raise HTTPException(400, f"invalid site_type: {body.site_type}")
+    async with _sm() as s:
+        if not await s.get(Company, body.company_id):
+            raise HTTPException(404, "company not found")
+        p = Plant(
+            name=body.name,
+            company_id=body.company_id,
+            site_address=body.site_address,
+            site_type=body.site_type,
+            plant_manager_contact_id=body.plant_manager_contact_id or None,
+            standards_notes=body.standards_notes,
+            notes=body.notes,
+        )
+        s.add(p)
+        await s.commit()
+        await s.refresh(p)
+    await _audit("plant.create", body.model_dump(), summary=f"{p.id} {p.name}")
+    return {"id": p.id, "name": p.name}
+
+
+class PlantPatch(BaseModel):
+    name: str | None = None
+    site_address: str | None = None
+    site_type: str | None = None
+    plant_manager_contact_id: str | None = None
+    standards_notes: str | None = None
+    notes: str | None = None
+    company_id: str | None = None
+
+
+@router.patch("/plants/{plant_id}")
+async def patch_plant(plant_id: str, body: PlantPatch):
+    from ..db.models import Plant
+    async with _sm() as s:
+        p = await s.get(Plant, plant_id)
+        if not p:
+            raise HTTPException(404, "plant not found")
+        if body.site_type is not None:
+            if body.site_type not in _PLANT_SITE_TYPES:
+                raise HTTPException(400, f"invalid site_type: {body.site_type}")
+            p.site_type = body.site_type
+        for f in ("name", "site_address", "standards_notes", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(p, f, v)
+        if body.plant_manager_contact_id is not None:
+            p.plant_manager_contact_id = body.plant_manager_contact_id or None
+        if body.company_id is not None:
+            p.company_id = body.company_id
+        await s.commit()
+    await _audit("plant.patch", {"id": plant_id, **body.model_dump(exclude_none=True)},
+                 summary=plant_id)
+    return {"id": plant_id, "updated": True}
+
+
+@router.delete("/plants/{plant_id}")
+async def delete_plant(plant_id: str):
+    from ..db.models import Plant
+    return await _delete_by_id(Plant, plant_id, "plant.delete", "plant")
+
+
+# ---- Specs (standards / certifications library) -------------------
+
+
+@router.get("/specs")
+async def list_specs(family: str = "", q: str = "", limit: int = 200):
+    from ..db.models import Spec
+    async with _sm() as s:
+        q_stmt = select(Spec).order_by(Spec.family, Spec.code).limit(limit)
+        if family:
+            q_stmt = select(Spec).where(Spec.family == family).order_by(Spec.code)
+        elif q:
+            q_stmt = select(Spec).where(
+                Spec.code.ilike(f"%{q}%") | Spec.name.ilike(f"%{q}%")
+            ).order_by(Spec.code).limit(limit)
+        rows = (await s.execute(q_stmt)).scalars().all()
+    return {
+        "specs": [
+            {"id": r.id, "code": r.code, "name": r.name,
+             "family": r.family, "scope": r.scope or "",
+             "evidence_required": r.evidence_required or ""}
+            for r in rows
+        ],
+    }
+
+
+class SpecCreate(BaseModel):
+    code: str
+    name: str
+    family: str = "other"
+    scope: str = ""
+    evidence_required: str = ""
+
+
+@router.post("/specs")
+async def create_spec(body: SpecCreate):
+    from sqlalchemy.exc import IntegrityError
+    from ..db.models import Spec
+    if body.family not in _SPEC_FAMILIES:
+        raise HTTPException(400, f"invalid family: {body.family}")
+    async with _sm() as s:
+        sp = Spec(
+            code=body.code, name=body.name, family=body.family,
+            scope=body.scope, evidence_required=body.evidence_required,
+        )
+        s.add(sp)
+        try:
+            await s.commit()
+        except IntegrityError:
+            await s.rollback()
+            raise HTTPException(409, f"spec code already exists: {body.code}")
+        await s.refresh(sp)
+    await _audit("spec.create", body.model_dump(), summary=sp.id)
+    return {"id": sp.id, "code": sp.code}
+
+
+class SpecPatch(BaseModel):
+    name: str | None = None
+    family: str | None = None
+    scope: str | None = None
+    evidence_required: str | None = None
+
+
+@router.patch("/specs/{spec_id}")
+async def patch_spec(spec_id: str, body: SpecPatch):
+    from ..db.models import Spec
+    async with _sm() as s:
+        sp = await s.get(Spec, spec_id)
+        if not sp:
+            raise HTTPException(404, "spec not found")
+        if body.family is not None:
+            if body.family not in _SPEC_FAMILIES:
+                raise HTTPException(400, f"invalid family: {body.family}")
+            sp.family = body.family
+        for f in ("name", "scope", "evidence_required"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(sp, f, v)
+        await s.commit()
+    await _audit("spec.patch", {"id": spec_id, **body.model_dump(exclude_none=True)},
+                 summary=spec_id)
+    return {"id": spec_id, "updated": True}
+
+
+@router.delete("/specs/{spec_id}")
+async def delete_spec(spec_id: str):
+    from ..db.models import Spec
+    return await _delete_by_id(Spec, spec_id, "spec.delete", "spec")
+
+
+# ---- Compliance Matrix --------------------------------------------
+
+
+@router.get("/bids/{bid_id}/compliance")
+async def list_compliance(bid_id: str):
+    from ..db.models import Bid, ComplianceMatrixItem
+    async with _sm() as s:
+        if not await s.get(Bid, bid_id):
+            raise HTTPException(404, "bid not found")
+        rows = (await s.execute(
+            select(ComplianceMatrixItem).where(ComplianceMatrixItem.bid_id == bid_id)
+            .order_by(ComplianceMatrixItem.sort_order, ComplianceMatrixItem.created_at)
+        )).scalars().all()
+
+    summary = {s_: 0 for s_ in _COMPLIANCE_STATUSES}
+    for r in rows:
+        summary[r.status or "unanswered"] = summary.get(r.status or "unanswered", 0) + 1
+
+    return {
+        "items": [
+            {"id": r.id, "clause_section": r.clause_section or "",
+             "clause_text": r.clause_text, "our_response": r.our_response or "",
+             "status": r.status or "unanswered",
+             "spec_ids": [sid for sid in (r.spec_ids or "").split(",") if sid],
+             "notes": r.notes or "", "sort_order": r.sort_order or 0}
+            for r in rows
+        ],
+        "summary": summary,
+        "total": len(rows),
+    }
+
+
+class ComplianceCreate(BaseModel):
+    clause_section: str = ""
+    clause_text: str
+    our_response: str = ""
+    status: str = "unanswered"
+    spec_ids: list[str] = []
+    notes: str = ""
+    sort_order: int = 0
+
+
+@router.post("/bids/{bid_id}/compliance")
+async def create_compliance(bid_id: str, body: ComplianceCreate):
+    from ..db.models import Bid, ComplianceMatrixItem
+    if body.status not in _COMPLIANCE_STATUSES:
+        raise HTTPException(400, f"invalid status: {body.status}")
+    async with _sm() as s:
+        if not await s.get(Bid, bid_id):
+            raise HTTPException(404, "bid not found")
+        item = ComplianceMatrixItem(
+            bid_id=bid_id,
+            clause_section=body.clause_section,
+            clause_text=body.clause_text,
+            our_response=body.our_response,
+            status=body.status,
+            spec_ids=",".join(body.spec_ids),
+            notes=body.notes,
+            sort_order=body.sort_order,
+        )
+        s.add(item)
+        await s.commit()
+        await s.refresh(item)
+    await _audit("compliance.create", {"bid_id": bid_id, **body.model_dump()}, summary=item.id)
+    return {"id": item.id}
+
+
+class ComplianceBulk(BaseModel):
+    """Bulk-paste mode: one clause per line. Lines starting with a section
+    marker like "4.2.1 " split into clause_section + clause_text."""
+    text: str
+
+
+@router.post("/bids/{bid_id}/compliance/bulk")
+async def bulk_compliance(bid_id: str, body: ComplianceBulk):
+    import re
+    from ..db.models import Bid, ComplianceMatrixItem
+    async with _sm() as s:
+        if not await s.get(Bid, bid_id):
+            raise HTTPException(404, "bid not found")
+        lines = [ln.strip() for ln in body.text.splitlines() if ln.strip()]
+        # Match leading "1.2.3" or "Section 4.2.1" style markers
+        section_re = re.compile(r"^(?:Section\s+)?([\w\-\.]+)\s+(.*)$")
+        created = 0
+        for i, raw in enumerate(lines):
+            m = section_re.match(raw)
+            if m and any(ch.isdigit() for ch in m.group(1)):
+                section = m.group(1)
+                text = m.group(2)
+            else:
+                section, text = "", raw
+            s.add(ComplianceMatrixItem(
+                bid_id=bid_id,
+                clause_section=section,
+                clause_text=text,
+                status="unanswered",
+                sort_order=i,
+            ))
+            created += 1
+        await s.commit()
+    await _audit("compliance.bulk", {"bid_id": bid_id, "count": created}, summary=f"{created} clauses")
+    return {"created": created}
+
+
+class CompliancePatch(BaseModel):
+    clause_section: str | None = None
+    clause_text: str | None = None
+    our_response: str | None = None
+    status: str | None = None
+    spec_ids: list[str] | None = None
+    notes: str | None = None
+    sort_order: int | None = None
+
+
+@router.patch("/compliance/{item_id}")
+async def patch_compliance(item_id: str, body: CompliancePatch):
+    from ..db.models import ComplianceMatrixItem
+    async with _sm() as s:
+        item = await s.get(ComplianceMatrixItem, item_id)
+        if not item:
+            raise HTTPException(404, "compliance item not found")
+        if body.status is not None:
+            if body.status not in _COMPLIANCE_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            item.status = body.status
+        for f in ("clause_section", "clause_text", "our_response", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(item, f, v)
+        if body.spec_ids is not None:
+            item.spec_ids = ",".join(body.spec_ids)
+        if body.sort_order is not None:
+            item.sort_order = body.sort_order
+        await s.commit()
+    await _audit("compliance.patch", {"id": item_id, **body.model_dump(exclude_none=True)},
+                 summary=item_id)
+    return {"id": item_id, "updated": True}
+
+
+@router.delete("/compliance/{item_id}")
+async def delete_compliance(item_id: str):
+    from ..db.models import ComplianceMatrixItem
+    return await _delete_by_id(ComplianceMatrixItem, item_id, "compliance.delete", "compliance item")
 
 

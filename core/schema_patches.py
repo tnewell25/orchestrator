@@ -42,6 +42,12 @@ _COLUMN_PATCHES: list[tuple[str, str]] = [
     ("audit_log", "output_tokens INTEGER DEFAULT 0"),
     ("audit_log", "cache_read_tokens INTEGER DEFAULT 0"),
     ("audit_log", "cache_creation_tokens INTEGER DEFAULT 0"),
+
+    # PR3 — industrial data model. Plants attach to deals and bids so
+    # account planning happens at the site level (the right unit for
+    # multi-site industrial customers like Bosch/Honeywell).
+    ("deals", "plant_id VARCHAR REFERENCES plants(id) ON DELETE SET NULL"),
+    ("bids", "plant_id VARCHAR REFERENCES plants(id) ON DELETE SET NULL"),
 ]
 
 
