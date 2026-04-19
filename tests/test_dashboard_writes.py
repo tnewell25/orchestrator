@@ -828,6 +828,123 @@ async def test_service_contract_lifecycle(client):
 
 
 @pytest.mark.asyncio
+async def test_job_lifecycle_with_logs_changes_punch(client, session_maker):
+    """Job + nested daily logs / change orders / punchlist round-trip."""
+    from orchestrator.db.models import ChangeOrder, DailyLog, PunchlistItem
+
+    co = (await client.post("/api/dashboard/companies", json={"name": "Site Owner"})).json()
+    job = (await client.post("/api/dashboard/jobs", json={
+        "name": "Plant 7 Install", "company_id": co["id"],
+        "stage": "in_progress", "contract_value_usd": 850_000,
+    })).json()
+
+    # Daily log
+    log = (await client.post(f"/api/dashboard/jobs/{job['id']}/daily-logs", json={
+        "summary": "Crew of 4 ran conduit on north wall",
+        "hours_total": 32,
+    })).json()
+    # Change order with status transition
+    chg = (await client.post(f"/api/dashboard/jobs/{job['id']}/change-orders", json={
+        "description": "Add fiber drop in MCC-2 per owner request",
+        "co_number": "CO-001", "price_usd": 12_500, "labor_hours": 18,
+    })).json()
+    await client.patch(f"/api/dashboard/change-orders/{chg['id']}", json={
+        "status": "approved", "approver": "Hans (owner)",
+    })
+    # Punchlist
+    p = (await client.post(f"/api/dashboard/jobs/{job['id']}/punchlist", json={
+        "description": "Touch-up paint on conduit clamps",
+        "location": "North wall, panel 3",
+    })).json()
+    await client.patch(f"/api/dashboard/punchlist/{p['id']}", json={"status": "done"})
+
+    # Job detail rolls them all up
+    detail = (await client.get(f"/api/dashboard/jobs/{job['id']}")).json()
+    assert len(detail["daily_logs"]) == 1
+    assert len(detail["change_orders"]) == 1
+    assert detail["change_orders"][0]["status"] == "approved"
+    assert len(detail["punchlist"]) == 1
+    assert detail["punchlist"][0]["status"] == "done"
+
+    # Approved CO has approved_at set
+    async with session_maker() as s:
+        co_row = await s.get(ChangeOrder, chg["id"])
+        assert co_row.approved_at is not None
+        # Done punch has completed_at set
+        p_row = await s.get(PunchlistItem, p["id"])
+        assert p_row.completed_at is not None
+        # Daily log persisted
+        log_row = await s.get(DailyLog, log["id"])
+        assert log_row.hours_total == 32
+
+
+@pytest.mark.asyncio
+async def test_competitor_with_battle_cards(client):
+    comp = (await client.post("/api/dashboard/competitors", json={
+        "name": "Siemens", "strengths": "Brand, breadth, EU footprint",
+        "weaknesses": "Slow PM cycle, expensive spares",
+    })).json()
+
+    # Duplicate name rejected
+    dup = await client.post("/api/dashboard/competitors", json={"name": "Siemens"})
+    assert dup.status_code == 409
+
+    bc = (await client.post(f"/api/dashboard/competitors/{comp['id']}/battle-cards", json={
+        "situation": "Competing against PCS 7 in chemicals",
+        "content": "Lead with our 24x7 spares depot in Houston. Their Phoenix cuts response time.",
+    })).json()
+
+    listed = (await client.get(f"/api/dashboard/competitors/{comp['id']}/battle-cards")).json()
+    assert len(listed["battle_cards"]) == 1
+    assert listed["battle_cards"][0]["id"] == bc["id"]
+
+
+@pytest.mark.asyncio
+async def test_proposal_search(client):
+    p1 = (await client.post("/api/dashboard/proposals", json={
+        "title": "DCS migration scope template",
+        "section_type": "scope",
+        "content": "Phase 1 baseline survey, FAT/SAT, cutover plan...",
+        "tags": "dcs, migration, brownfield",
+    })).json()
+    (await client.post("/api/dashboard/proposals", json={
+        "title": "Standard warranty terms",
+        "section_type": "warranty",
+        "content": "Two-year parts + labor on installed equipment.",
+        "tags": "warranty",
+    })).json()
+
+    listed = (await client.get("/api/dashboard/proposals", params={"q": "migration"})).json()
+    assert any(p["id"] == p1["id"] for p in listed["proposals"])
+    by_type = (await client.get("/api/dashboard/proposals", params={"section_type": "warranty"})).json()
+    assert all(p["section_type"] == "warranty" for p in by_type["proposals"])
+
+
+@pytest.mark.asyncio
+async def test_win_loss_aggregation(client):
+    deal_won = (await client.post("/api/dashboard/deals", json={"name": "Won deal", "value_usd": 500_000})).json()
+    deal_lost = (await client.post("/api/dashboard/deals", json={"name": "Lost deal", "value_usd": 300_000})).json()
+
+    await client.post("/api/dashboard/win-loss", json={
+        "deal_id": deal_won["id"], "outcome": "won", "value_usd": 500_000,
+        "primary_reason": "Champion strength + 24x7 service", "what_worked": "Plant visit early",
+    })
+    await client.post("/api/dashboard/win-loss", json={
+        "deal_id": deal_lost["id"], "outcome": "lost", "value_usd": 300_000,
+        "winning_competitor": "Siemens", "primary_reason": "Parent-co standards override",
+    })
+    bad = await client.post("/api/dashboard/win-loss", json={"deal_id": deal_won["id"], "outcome": "fake"})
+    assert bad.status_code == 400
+
+    summary = (await client.get("/api/dashboard/win-loss")).json()
+    assert summary["stats"]["total"] == 2
+    assert summary["stats"]["won"] == 1
+    assert summary["stats"]["lost"] == 1
+    assert summary["stats"]["win_rate"] == 0.5
+    assert summary["stats"]["won_value"] == 500_000
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include

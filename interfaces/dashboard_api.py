@@ -2884,3 +2884,713 @@ async def delete_contract(contract_id: str):
     return await _delete_by_id(ServiceContract, contract_id, "contract.delete", "contract")
 
 
+# =====================================================================
+# PR9 — Jobs (post-won execution) + DailyLog + ChangeOrder + Punchlist
+# =====================================================================
+
+_JOB_STAGES = {"scheduled", "in_progress", "punch", "inspected", "closed_out", "warranty"}
+_CO_STATUSES = {"draft", "pm_review", "submitted", "approved", "rejected", "invoiced"}
+_PUNCH_STATUSES = {"open", "in_progress", "done", "waived"}
+
+
+@router.get("/jobs")
+async def list_jobs(stage: str = "", company_id: str = "", limit: int = 100):
+    from ..db.models import Company, Job
+    async with _sm() as s:
+        stmt = select(Job).order_by(Job.scheduled_start.asc().nullslast()).limit(limit)
+        clauses = []
+        if stage:
+            if stage not in _JOB_STAGES:
+                raise HTTPException(400, f"invalid stage: {stage}")
+            clauses.append(Job.stage == stage)
+        if company_id:
+            clauses.append(Job.company_id == company_id)
+        if clauses:
+            stmt = select(Job).where(*clauses).order_by(Job.scheduled_start.asc().nullslast()).limit(limit)
+        rows = (await s.execute(stmt)).scalars().all()
+        co_ids = {r.company_id for r in rows if r.company_id}
+        cos = {}
+        if co_ids:
+            crows = (await s.execute(select(Company).where(Company.id.in_(co_ids)))).scalars().all()
+            cos = {c.id: c.name for c in crows}
+    return {
+        "jobs": [
+            {
+                "id": r.id, "name": r.name, "job_number": r.job_number or "",
+                "stage": r.stage, "contract_value_usd": r.contract_value_usd or 0,
+                "scheduled_start": str(r.scheduled_start) if r.scheduled_start else None,
+                "scheduled_end": str(r.scheduled_end) if r.scheduled_end else None,
+                "company_id": r.company_id, "company": cos.get(r.company_id, ""),
+                "site_address": r.site_address or "",
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/jobs/{job_id}")
+async def job_detail(job_id: str):
+    from ..db.models import (
+        Bid, ChangeOrder, Company, DailyLog, Deal, Job, PunchlistItem, User,
+    )
+    async with _sm() as s:
+        j = await s.get(Job, job_id)
+        if not j:
+            raise HTTPException(404, "job not found")
+        co_name = ""
+        if j.company_id:
+            c = await s.get(Company, j.company_id)
+            if c: co_name = c.name
+        deal_name = ""
+        if j.deal_id:
+            d = await s.get(Deal, j.deal_id)
+            if d: deal_name = d.name
+        bid_name = ""
+        if j.bid_id:
+            b = await s.get(Bid, j.bid_id)
+            if b: bid_name = b.name
+        pm_name = ""
+        if j.project_manager_id:
+            pm = await s.get(User, j.project_manager_id)
+            if pm: pm_name = pm.name
+        foreman_name = ""
+        if j.foreman_id:
+            fm = await s.get(User, j.foreman_id)
+            if fm: foreman_name = fm.name
+        logs = (await s.execute(
+            select(DailyLog).where(DailyLog.job_id == job_id)
+            .order_by(DailyLog.log_date.desc()).limit(50)
+        )).scalars().all()
+        cos = (await s.execute(
+            select(ChangeOrder).where(ChangeOrder.job_id == job_id)
+            .order_by(ChangeOrder.created_at.desc())
+        )).scalars().all()
+        punch = (await s.execute(
+            select(PunchlistItem).where(PunchlistItem.job_id == job_id)
+            .order_by(PunchlistItem.status, PunchlistItem.created_at.desc())
+        )).scalars().all()
+    return {
+        "job": {
+            "id": j.id, "name": j.name, "job_number": j.job_number or "",
+            "stage": j.stage,
+            "site_address": j.site_address or "", "gc_name": j.gc_name or "",
+            "scope": j.scope or "",
+            "contract_value_usd": j.contract_value_usd or 0,
+            "labor_budget_hours": j.labor_budget_hours or 0,
+            "material_budget_usd": j.material_budget_usd or 0,
+            "scheduled_start": str(j.scheduled_start) if j.scheduled_start else None,
+            "scheduled_end": str(j.scheduled_end) if j.scheduled_end else None,
+            "actual_start": str(j.actual_start) if j.actual_start else None,
+            "actual_end": str(j.actual_end) if j.actual_end else None,
+            "notes": j.notes or "",
+            "company_id": j.company_id, "company": co_name,
+            "deal_id": j.deal_id, "deal": deal_name,
+            "bid_id": j.bid_id, "bid": bid_name,
+            "project_manager_id": j.project_manager_id, "project_manager": pm_name,
+            "foreman_id": j.foreman_id, "foreman": foreman_name,
+        },
+        "daily_logs": [
+            {"id": l.id, "log_date": str(l.log_date),
+             "summary": l.summary or "", "work_performed": l.work_performed or "",
+             "issues": l.issues or "", "hours_total": l.hours_total or 0,
+             "next_day_plan": l.next_day_plan or ""}
+            for l in logs
+        ],
+        "change_orders": [
+            {"id": c.id, "co_number": c.co_number or "", "status": c.status,
+             "description": c.description or "", "price_usd": c.price_usd or 0,
+             "labor_hours": c.labor_hours or 0,
+             "approved_at": str(c.approved_at) if c.approved_at else None,
+             "approver": c.approver or ""}
+            for c in cos
+        ],
+        "punchlist": [
+            {"id": p.id, "description": p.description, "location": p.location or "",
+             "status": p.status,
+             "completed_at": str(p.completed_at) if p.completed_at else None}
+            for p in punch
+        ],
+    }
+
+
+class JobCreate(BaseModel):
+    name: str
+    company_id: str | None = None
+    deal_id: str | None = None
+    bid_id: str | None = None
+    job_number: str = ""
+    stage: str = "scheduled"
+    site_address: str = ""
+    gc_name: str = ""
+    scope: str = ""
+    contract_value_usd: float = 0.0
+    labor_budget_hours: float = 0.0
+    material_budget_usd: float = 0.0
+    scheduled_start: str | None = None
+    scheduled_end: str | None = None
+    notes: str = ""
+
+
+@router.post("/jobs")
+async def create_job(body: JobCreate):
+    from ..db.models import Job
+    if body.stage not in _JOB_STAGES:
+        raise HTTPException(400, f"invalid stage: {body.stage}")
+    async with _sm() as s:
+        j = Job(
+            name=body.name, job_number=body.job_number,
+            company_id=body.company_id or None, deal_id=body.deal_id or None, bid_id=body.bid_id or None,
+            stage=body.stage, site_address=body.site_address, gc_name=body.gc_name,
+            scope=body.scope, contract_value_usd=body.contract_value_usd,
+            labor_budget_hours=body.labor_budget_hours,
+            material_budget_usd=body.material_budget_usd,
+            scheduled_start=_parse_date(body.scheduled_start),
+            scheduled_end=_parse_date(body.scheduled_end),
+            notes=body.notes,
+        )
+        s.add(j); await s.commit(); await s.refresh(j)
+    await _audit("job.create", body.model_dump(), summary=f"{j.id} {j.name}")
+    return {"id": j.id, "name": j.name}
+
+
+class JobPatch(BaseModel):
+    name: str | None = None
+    job_number: str | None = None
+    stage: str | None = None
+    site_address: str | None = None
+    gc_name: str | None = None
+    scope: str | None = None
+    contract_value_usd: float | None = None
+    labor_budget_hours: float | None = None
+    material_budget_usd: float | None = None
+    scheduled_start: str | None = None
+    scheduled_end: str | None = None
+    actual_start: str | None = None
+    actual_end: str | None = None
+    notes: str | None = None
+    company_id: str | None = None
+    deal_id: str | None = None
+    bid_id: str | None = None
+
+
+@router.patch("/jobs/{job_id}")
+async def patch_job(job_id: str, body: JobPatch):
+    from ..db.models import Job
+    async with _sm() as s:
+        j = await s.get(Job, job_id)
+        if not j:
+            raise HTTPException(404, "job not found")
+        if body.stage is not None:
+            if body.stage not in _JOB_STAGES:
+                raise HTTPException(400, f"invalid stage: {body.stage}")
+            j.stage = body.stage
+        for f in ("name", "job_number", "site_address", "gc_name", "scope", "notes"):
+            v = getattr(body, f)
+            if v is not None: setattr(j, f, v)
+        for f in ("contract_value_usd", "labor_budget_hours", "material_budget_usd"):
+            v = getattr(body, f)
+            if v is not None: setattr(j, f, v)
+        for f in ("scheduled_start", "scheduled_end", "actual_start", "actual_end"):
+            v = getattr(body, f)
+            if v is not None: setattr(j, f, _parse_date(v))
+        for f in ("company_id", "deal_id", "bid_id"):
+            v = getattr(body, f)
+            if v is not None: setattr(j, f, v or None)
+        await s.commit()
+    await _audit("job.patch", {"id": job_id, **body.model_dump(exclude_none=True)}, summary=job_id)
+    return {"id": job_id, "updated": True}
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    from ..db.models import Job
+    return await _delete_by_id(Job, job_id, "job.delete", "job")
+
+
+# ---- Daily Logs ---------------------------------------------------
+
+
+class DailyLogCreate(BaseModel):
+    log_date: str | None = None
+    summary: str = ""
+    work_performed: str = ""
+    issues: str = ""
+    hours_total: float = 0.0
+    next_day_plan: str = ""
+    transcript: str = ""
+
+
+@router.post("/jobs/{job_id}/daily-logs")
+async def create_daily_log(job_id: str, body: DailyLogCreate):
+    from ..db.models import DailyLog, Job
+    async with _sm() as s:
+        if not await s.get(Job, job_id):
+            raise HTTPException(404, "job not found")
+        kwargs: dict = {
+            "job_id": job_id,
+            "summary": body.summary,
+            "work_performed": body.work_performed,
+            "issues": body.issues,
+            "hours_total": body.hours_total,
+            "next_day_plan": body.next_day_plan,
+            "transcript": body.transcript,
+        }
+        d = _parse_date(body.log_date)
+        if d is not None:
+            kwargs["log_date"] = d
+        log = DailyLog(**kwargs)
+        s.add(log); await s.commit(); await s.refresh(log)
+    await _audit("daily_log.create", {"job_id": job_id, **body.model_dump()}, summary=log.id)
+    return {"id": log.id}
+
+
+class DailyLogPatch(BaseModel):
+    log_date: str | None = None
+    summary: str | None = None
+    work_performed: str | None = None
+    issues: str | None = None
+    hours_total: float | None = None
+    next_day_plan: str | None = None
+
+
+@router.patch("/daily-logs/{log_id}")
+async def patch_daily_log(log_id: str, body: DailyLogPatch):
+    from ..db.models import DailyLog
+    async with _sm() as s:
+        log = await s.get(DailyLog, log_id)
+        if not log:
+            raise HTTPException(404, "log not found")
+        for f in ("summary", "work_performed", "issues", "next_day_plan"):
+            v = getattr(body, f)
+            if v is not None: setattr(log, f, v)
+        if body.log_date is not None:
+            log.log_date = _parse_date(body.log_date)
+        if body.hours_total is not None:
+            log.hours_total = body.hours_total
+        await s.commit()
+    await _audit("daily_log.patch", {"id": log_id, **body.model_dump(exclude_none=True)}, summary=log_id)
+    return {"id": log_id, "updated": True}
+
+
+@router.delete("/daily-logs/{log_id}")
+async def delete_daily_log(log_id: str):
+    from ..db.models import DailyLog
+    return await _delete_by_id(DailyLog, log_id, "daily_log.delete", "daily log")
+
+
+# ---- Change Orders ------------------------------------------------
+
+
+class ChangeOrderCreate(BaseModel):
+    description: str
+    co_number: str = ""
+    requested_by: str = ""
+    labor_hours: float = 0.0
+    material_cost_usd: float = 0.0
+    price_usd: float = 0.0
+    status: str = "draft"
+    notes: str = ""
+
+
+@router.post("/jobs/{job_id}/change-orders")
+async def create_change_order(job_id: str, body: ChangeOrderCreate):
+    from ..db.models import ChangeOrder, Job
+    if body.status not in _CO_STATUSES:
+        raise HTTPException(400, f"invalid status: {body.status}")
+    async with _sm() as s:
+        if not await s.get(Job, job_id):
+            raise HTTPException(404, "job not found")
+        co = ChangeOrder(
+            job_id=job_id, description=body.description,
+            co_number=body.co_number, requested_by=body.requested_by,
+            labor_hours=body.labor_hours, material_cost_usd=body.material_cost_usd,
+            price_usd=body.price_usd, status=body.status, notes=body.notes,
+        )
+        s.add(co); await s.commit(); await s.refresh(co)
+    await _audit("change_order.create", {"job_id": job_id, **body.model_dump()}, summary=co.id)
+    return {"id": co.id, "co_number": co.co_number}
+
+
+class ChangeOrderPatch(BaseModel):
+    description: str | None = None
+    co_number: str | None = None
+    status: str | None = None
+    requested_by: str | None = None
+    labor_hours: float | None = None
+    material_cost_usd: float | None = None
+    price_usd: float | None = None
+    approver: str | None = None
+    notes: str | None = None
+
+
+@router.patch("/change-orders/{co_id}")
+async def patch_change_order(co_id: str, body: ChangeOrderPatch):
+    from datetime import datetime as _dt, timezone as _tz
+    from ..db.models import ChangeOrder
+    async with _sm() as s:
+        co = await s.get(ChangeOrder, co_id)
+        if not co:
+            raise HTTPException(404, "change order not found")
+        if body.status is not None:
+            if body.status not in _CO_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            co.status = body.status
+            if body.status == "approved" and not co.approved_at:
+                co.approved_at = _dt.now(_tz.utc)
+        for f in ("description", "co_number", "requested_by", "approver", "notes"):
+            v = getattr(body, f)
+            if v is not None: setattr(co, f, v)
+        for f in ("labor_hours", "material_cost_usd", "price_usd"):
+            v = getattr(body, f)
+            if v is not None: setattr(co, f, v)
+        await s.commit()
+    await _audit("change_order.patch", {"id": co_id, **body.model_dump(exclude_none=True)}, summary=co_id)
+    return {"id": co_id, "updated": True}
+
+
+@router.delete("/change-orders/{co_id}")
+async def delete_change_order(co_id: str):
+    from ..db.models import ChangeOrder
+    return await _delete_by_id(ChangeOrder, co_id, "change_order.delete", "change order")
+
+
+# ---- Punchlist ----------------------------------------------------
+
+
+class PunchCreate(BaseModel):
+    description: str
+    location: str = ""
+    status: str = "open"
+
+
+@router.post("/jobs/{job_id}/punchlist")
+async def create_punch(job_id: str, body: PunchCreate):
+    from ..db.models import Job, PunchlistItem
+    if body.status not in _PUNCH_STATUSES:
+        raise HTTPException(400, f"invalid status: {body.status}")
+    async with _sm() as s:
+        if not await s.get(Job, job_id):
+            raise HTTPException(404, "job not found")
+        p = PunchlistItem(
+            job_id=job_id, description=body.description,
+            location=body.location, status=body.status,
+        )
+        s.add(p); await s.commit(); await s.refresh(p)
+    await _audit("punch.create", {"job_id": job_id, **body.model_dump()}, summary=p.id)
+    return {"id": p.id}
+
+
+class PunchPatch(BaseModel):
+    description: str | None = None
+    location: str | None = None
+    status: str | None = None
+
+
+@router.patch("/punchlist/{punch_id}")
+async def patch_punch(punch_id: str, body: PunchPatch):
+    from datetime import datetime as _dt, timezone as _tz
+    from ..db.models import PunchlistItem
+    async with _sm() as s:
+        p = await s.get(PunchlistItem, punch_id)
+        if not p:
+            raise HTTPException(404, "punch item not found")
+        if body.status is not None:
+            if body.status not in _PUNCH_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            p.status = body.status
+            if body.status == "done" and not p.completed_at:
+                p.completed_at = _dt.now(_tz.utc)
+        for f in ("description", "location"):
+            v = getattr(body, f)
+            if v is not None: setattr(p, f, v)
+        await s.commit()
+    await _audit("punch.patch", {"id": punch_id, **body.model_dump(exclude_none=True)}, summary=punch_id)
+    return {"id": punch_id, "updated": True}
+
+
+@router.delete("/punchlist/{punch_id}")
+async def delete_punch(punch_id: str):
+    from ..db.models import PunchlistItem
+    return await _delete_by_id(PunchlistItem, punch_id, "punch.delete", "punch item")
+
+
+# =====================================================================
+# PR10 — Competitors + Battle Cards + Proposal Library + Win/Loss
+# =====================================================================
+
+
+@router.get("/competitors")
+async def list_competitors():
+    from ..db.models import BattleCard, Competitor
+    async with _sm() as s:
+        rows = (await s.execute(select(Competitor).order_by(Competitor.name))).scalars().all()
+        # Count battle cards per competitor for the list view
+        bc_rows = (await s.execute(select(BattleCard))).scalars().all()
+        bc_count: dict[str, int] = {}
+        for bc in bc_rows:
+            if bc.competitor_id:
+                bc_count[bc.competitor_id] = bc_count.get(bc.competitor_id, 0) + 1
+    return {
+        "competitors": [
+            {"id": r.id, "name": r.name, "aliases": r.aliases or "",
+             "strengths": r.strengths or "", "weaknesses": r.weaknesses or "",
+             "pricing_notes": r.pricing_notes or "",
+             "battle_card_count": bc_count.get(r.id, 0)}
+            for r in rows
+        ],
+    }
+
+
+class CompetitorCreate(BaseModel):
+    name: str
+    aliases: str = ""
+    strengths: str = ""
+    weaknesses: str = ""
+    pricing_notes: str = ""
+
+
+@router.post("/competitors")
+async def create_competitor(body: CompetitorCreate):
+    from sqlalchemy.exc import IntegrityError
+    from ..db.models import Competitor
+    async with _sm() as s:
+        c = Competitor(**body.model_dump())
+        s.add(c)
+        try:
+            await s.commit()
+        except IntegrityError:
+            await s.rollback()
+            raise HTTPException(409, f"competitor '{body.name}' already exists")
+        await s.refresh(c)
+    await _audit("competitor.create", body.model_dump(), summary=c.id)
+    return {"id": c.id, "name": c.name}
+
+
+class CompetitorPatch(BaseModel):
+    name: str | None = None
+    aliases: str | None = None
+    strengths: str | None = None
+    weaknesses: str | None = None
+    pricing_notes: str | None = None
+
+
+@router.patch("/competitors/{comp_id}")
+async def patch_competitor(comp_id: str, body: CompetitorPatch):
+    from ..db.models import Competitor
+    async with _sm() as s:
+        c = await s.get(Competitor, comp_id)
+        if not c:
+            raise HTTPException(404, "competitor not found")
+        for f in ("name", "aliases", "strengths", "weaknesses", "pricing_notes"):
+            v = getattr(body, f)
+            if v is not None: setattr(c, f, v)
+        await s.commit()
+    await _audit("competitor.patch", {"id": comp_id, **body.model_dump(exclude_none=True)}, summary=comp_id)
+    return {"id": comp_id, "updated": True}
+
+
+@router.delete("/competitors/{comp_id}")
+async def delete_competitor(comp_id: str):
+    from ..db.models import Competitor
+    return await _delete_by_id(Competitor, comp_id, "competitor.delete", "competitor")
+
+
+# ---- Battle Cards (linked to a competitor) -----------------------
+
+
+@router.get("/competitors/{comp_id}/battle-cards")
+async def list_battle_cards(comp_id: str):
+    from ..db.models import BattleCard
+    async with _sm() as s:
+        rows = (await s.execute(
+            select(BattleCard).where(BattleCard.competitor_id == comp_id)
+            .order_by(BattleCard.created_at.desc())
+        )).scalars().all()
+    return {
+        "battle_cards": [
+            {"id": r.id, "situation": r.situation or "", "content": r.content,
+             "created_at": str(r.created_at)}
+            for r in rows
+        ],
+    }
+
+
+class BattleCardCreate(BaseModel):
+    situation: str = ""
+    content: str
+
+
+@router.post("/competitors/{comp_id}/battle-cards")
+async def create_battle_card(comp_id: str, body: BattleCardCreate):
+    from ..db.models import BattleCard, Competitor
+    async with _sm() as s:
+        if not await s.get(Competitor, comp_id):
+            raise HTTPException(404, "competitor not found")
+        bc = BattleCard(competitor_id=comp_id, situation=body.situation, content=body.content)
+        s.add(bc); await s.commit(); await s.refresh(bc)
+    await _audit("battle_card.create", {"competitor_id": comp_id, **body.model_dump()}, summary=bc.id)
+    return {"id": bc.id}
+
+
+@router.delete("/battle-cards/{bc_id}")
+async def delete_battle_card(bc_id: str):
+    from ..db.models import BattleCard
+    return await _delete_by_id(BattleCard, bc_id, "battle_card.delete", "battle card")
+
+
+# ---- Proposal Library --------------------------------------------
+
+
+@router.get("/proposals")
+async def list_proposals(section_type: str = "", q: str = "", limit: int = 100):
+    from ..db.models import ProposalPrecedent
+    async with _sm() as s:
+        stmt = select(ProposalPrecedent).order_by(ProposalPrecedent.created_at.desc()).limit(limit)
+        clauses = []
+        if section_type:
+            clauses.append(ProposalPrecedent.section_type == section_type)
+        if q:
+            clauses.append(
+                ProposalPrecedent.title.ilike(f"%{q}%")
+                | ProposalPrecedent.content.ilike(f"%{q}%")
+                | ProposalPrecedent.tags.ilike(f"%{q}%")
+            )
+        if clauses:
+            stmt = select(ProposalPrecedent).where(*clauses).order_by(ProposalPrecedent.created_at.desc()).limit(limit)
+        rows = (await s.execute(stmt)).scalars().all()
+    return {
+        "proposals": [
+            {"id": r.id, "title": r.title, "section_type": r.section_type or "",
+             "content": r.content, "tags": r.tags or "",
+             "source_deal_id": r.source_deal_id}
+            for r in rows
+        ],
+    }
+
+
+class ProposalCreate(BaseModel):
+    title: str
+    section_type: str = ""
+    content: str
+    tags: str = ""
+    source_deal_id: str | None = None
+
+
+@router.post("/proposals")
+async def create_proposal(body: ProposalCreate):
+    from ..db.models import ProposalPrecedent
+    async with _sm() as s:
+        p = ProposalPrecedent(
+            title=body.title, section_type=body.section_type,
+            content=body.content, tags=body.tags,
+            source_deal_id=body.source_deal_id or None,
+        )
+        s.add(p); await s.commit(); await s.refresh(p)
+    await _audit("proposal.create", body.model_dump(), summary=p.id)
+    return {"id": p.id}
+
+
+class ProposalPatch(BaseModel):
+    title: str | None = None
+    section_type: str | None = None
+    content: str | None = None
+    tags: str | None = None
+
+
+@router.patch("/proposals/{p_id}")
+async def patch_proposal(p_id: str, body: ProposalPatch):
+    from ..db.models import ProposalPrecedent
+    async with _sm() as s:
+        p = await s.get(ProposalPrecedent, p_id)
+        if not p:
+            raise HTTPException(404, "proposal precedent not found")
+        for f in ("title", "section_type", "content", "tags"):
+            v = getattr(body, f)
+            if v is not None: setattr(p, f, v)
+        await s.commit()
+    await _audit("proposal.patch", {"id": p_id, **body.model_dump(exclude_none=True)}, summary=p_id)
+    return {"id": p_id, "updated": True}
+
+
+@router.delete("/proposals/{p_id}")
+async def delete_proposal(p_id: str):
+    from ..db.models import ProposalPrecedent
+    return await _delete_by_id(ProposalPrecedent, p_id, "proposal.delete", "proposal precedent")
+
+
+# ---- Win/Loss ------------------------------------------------------
+
+
+@router.get("/win-loss")
+async def list_win_loss(limit: int = 100):
+    from ..db.models import Deal, WinLossRecord
+    async with _sm() as s:
+        rows = (await s.execute(
+            select(WinLossRecord).order_by(WinLossRecord.created_at.desc()).limit(limit)
+        )).scalars().all()
+        deal_ids = {r.deal_id for r in rows if r.deal_id}
+        deals = {}
+        if deal_ids:
+            drows = (await s.execute(select(Deal).where(Deal.id.in_(deal_ids)))).scalars().all()
+            deals = {d.id: d for d in drows}
+
+    won = [r for r in rows if r.outcome == "won"]
+    lost = [r for r in rows if r.outcome == "lost"]
+    total_value = sum(r.value_usd or 0 for r in rows)
+    win_rate = (len(won) / len(rows)) if rows else 0
+
+    return {
+        "stats": {
+            "total": len(rows), "won": len(won), "lost": len(lost),
+            "win_rate": round(win_rate, 3),
+            "total_value": total_value,
+            "won_value": sum(r.value_usd or 0 for r in won),
+            "lost_value": sum(r.value_usd or 0 for r in lost),
+        },
+        "records": [
+            {"id": r.id, "outcome": r.outcome,
+             "winning_competitor": r.winning_competitor or "",
+             "primary_reason": r.primary_reason or "",
+             "what_worked": r.what_worked or "",
+             "what_didnt": r.what_didnt or "",
+             "lessons": r.lessons or "",
+             "value_usd": r.value_usd or 0,
+             "deal_id": r.deal_id,
+             "deal_name": deals[r.deal_id].name if r.deal_id in deals else "",
+             "created_at": str(r.created_at)}
+            for r in rows
+        ],
+    }
+
+
+class WinLossCreate(BaseModel):
+    deal_id: str
+    outcome: str  # won | lost | no_decision
+    winning_competitor: str = ""
+    primary_reason: str = ""
+    what_worked: str = ""
+    what_didnt: str = ""
+    lessons: str = ""
+    value_usd: float = 0.0
+
+
+@router.post("/win-loss")
+async def create_win_loss(body: WinLossCreate):
+    from ..db.models import Deal, WinLossRecord
+    if body.outcome not in {"won", "lost", "no_decision"}:
+        raise HTTPException(400, f"invalid outcome: {body.outcome}")
+    async with _sm() as s:
+        if not await s.get(Deal, body.deal_id):
+            raise HTTPException(404, "deal not found")
+        r = WinLossRecord(**body.model_dump())
+        s.add(r); await s.commit(); await s.refresh(r)
+    await _audit("win_loss.create", body.model_dump(), summary=r.id)
+    return {"id": r.id}
+
+
+@router.delete("/win-loss/{r_id}")
+async def delete_win_loss(r_id: str):
+    from ..db.models import WinLossRecord
+    return await _delete_by_id(WinLossRecord, r_id, "win_loss.delete", "win/loss record")
+
+
