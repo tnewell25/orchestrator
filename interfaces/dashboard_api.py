@@ -1741,6 +1741,357 @@ async def delete_compliance(item_id: str):
 # =====================================================================
 
 
+# =====================================================================
+# PR5 — Forecast + champion strength + AI MEDDIC suggester
+# Deterministic, explainable scoring so reps trust the bucket placement.
+# Reps mistrust black-box AI forecasts — they want to see the rationale.
+# =====================================================================
+
+
+def _recency_decay(last_touch_dt) -> float:
+    """0.0 (cold) to 1.0 (today). Industrial cycles run long, so we
+    don't punish a deal that's been quiet for 2 weeks the way a SaaS
+    forecast would. Scale: today=1.0, 7d=1.0, 30d=0.7, 60d=0.4, 90d+=0.1."""
+    if not last_touch_dt:
+        return 0.2  # we don't know — treat as warmish, don't punish hard
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    if last_touch_dt.tzinfo is None:
+        last_touch_dt = last_touch_dt.replace(tzinfo=_tz.utc)
+    days = max(0, (now - last_touch_dt).days)
+    if days <= 7: return 1.0
+    if days <= 30: return 0.7
+    if days <= 60: return 0.4
+    if days <= 90: return 0.2
+    return 0.1
+
+
+def _sentiment_w(s: str) -> float:
+    return {"supportive": 1.0, "neutral": 0.5, "opposed": 0.0, "unknown": 0.3}.get(s, 0.3)
+
+
+def _influence_w(i: str) -> float:
+    return {"high": 1.0, "medium": 0.6, "low": 0.3}.get(i, 0.5)
+
+
+def _champion_strength(champion_stake, champion_contact) -> tuple[int, str]:
+    """0-100 + a one-line explanation. The single most predictive
+    variable for industrial deals — research is clear that 9/10 deals
+    with a 3/10 champion are 3/10 deals."""
+    if not champion_stake:
+        return 0, "no champion mapped"
+    s = _sentiment_w(champion_stake.sentiment)
+    i = _influence_w(champion_stake.influence)
+    last_touch = champion_contact.last_touch if champion_contact else None
+    r = _recency_decay(last_touch)
+    score = round(s * i * r * 100)
+    bits = []
+    bits.append(champion_stake.sentiment)
+    bits.append(f"{champion_stake.influence} influence")
+    if last_touch:
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        lt = last_touch if last_touch.tzinfo else last_touch.replace(tzinfo=_tz.utc)
+        days = max(0, (now - lt).days)
+        bits.append(f"last touch {days}d ago")
+    else:
+        bits.append("no last-touch on file")
+    return score, ", ".join(bits)
+
+
+def _meddic_fill(deal) -> tuple[int, list[str]]:
+    """Returns (percent_filled, missing_field_labels)."""
+    fields = [
+        ("metrics", deal.metrics),
+        ("economic buyer", deal.economic_buyer_id),
+        ("champion", deal.champion_id),
+        ("decision criteria", deal.decision_criteria),
+        ("decision process", deal.decision_process),
+        ("paper process", deal.paper_process),
+        ("pain", deal.pain),
+    ]
+    filled = sum(1 for _, v in fields if v)
+    missing = [name for name, v in fields if not v]
+    return round(100 * filled / len(fields)), missing
+
+
+_STAGE_BASE_SLIP = {
+    "prospect": 90, "qualified": 70, "proposal": 40, "negotiation": 15,
+    "closed_won": 0, "closed_lost": 0,
+}
+
+
+def _slip_risk(deal, meddic_pct: int, champion: int) -> int:
+    """Probability deal won't close THIS QUARTER. Distinct from loss
+    risk — industrial deals slip a fiscal quarter routinely without
+    being lost."""
+    base = _STAGE_BASE_SLIP.get(deal.stage or "prospect", 90)
+    if meddic_pct < 50:
+        base += 20
+    if champion < 40:
+        base += 15
+    if not deal.close_date:
+        base += 10
+    else:
+        from datetime import date as _date
+        days_to_close = (deal.close_date - _date.today()).days
+        if 0 < days_to_close <= 30 and (deal.stage or "") in ("prospect", "qualified"):
+            base += 25
+    return max(0, min(100, base))
+
+
+def _bucket(deal, meddic_pct: int, champion: int) -> tuple[str, list[str]]:
+    """Commit / Best Case / Pipeline + top-3 reasons."""
+    reasons: list[str] = []
+    stage = deal.stage or "prospect"
+    if stage in ("negotiation",) and meddic_pct >= 70 and champion >= 60:
+        reasons.append(f"in negotiation with strong champion ({champion}/100)")
+        if deal.paper_process:
+            reasons.append("paper process documented")
+        return "commit", reasons[:3]
+    if stage in ("proposal", "negotiation") and meddic_pct >= 50 and champion >= 40:
+        reasons.append(f"stage: {stage}")
+        reasons.append(f"MEDDIC {meddic_pct}%")
+        if champion >= 60:
+            reasons.append(f"champion {champion}/100")
+        return "best_case", reasons[:3]
+    # Pipeline default
+    if meddic_pct < 50:
+        reasons.append(f"MEDDIC only {meddic_pct}% complete")
+    if champion < 40:
+        reasons.append(f"champion weak ({champion}/100)" if champion else "no champion mapped")
+    if stage in ("prospect", "qualified"):
+        reasons.append(f"stage: {stage}")
+    return "pipeline", reasons[:3]
+
+
+@router.get("/forecast")
+async def forecast():
+    """Active deals bucketed Commit / Best Case / Pipeline with rationale.
+
+    Two distinct probabilities per deal — slip risk (won't close this
+    quarter) and champion strength (predictor of win-eventually). Reps
+    trust forecasts they can see the math behind."""
+    from ..db.models import Contact, Deal, DealStakeholder, Meeting
+
+    async with _sm() as s:
+        deals = (await s.execute(
+            select(Deal).where(Deal.stage.notin_(("closed_won", "closed_lost")))
+            .order_by(Deal.value_usd.desc().nullslast())
+        )).scalars().all()
+
+        # Bulk-load related data
+        deal_ids = [d.id for d in deals]
+        stakeholders_by_deal: dict[str, list] = {}
+        if deal_ids:
+            stakeholder_rows = (await s.execute(
+                select(DealStakeholder).where(DealStakeholder.deal_id.in_(deal_ids))
+            )).scalars().all()
+            for st in stakeholder_rows:
+                stakeholders_by_deal.setdefault(st.deal_id, []).append(st)
+
+        contact_ids = {d.champion_id for d in deals if d.champion_id}
+        contacts = {}
+        if contact_ids:
+            crows = (await s.execute(
+                select(Contact).where(Contact.id.in_(contact_ids))
+            )).scalars().all()
+            contacts = {c.id: c for c in crows}
+
+    buckets = {"commit": [], "best_case": [], "pipeline": []}
+    for d in deals:
+        meddic_pct, missing = _meddic_fill(d)
+        # Find the champion stakeholder for this deal
+        champ_stake = next(
+            (st for st in stakeholders_by_deal.get(d.id, []) if st.role == "champion"),
+            None,
+        )
+        champ_contact = contacts.get(d.champion_id) if d.champion_id else None
+        champion_score, champion_detail = _champion_strength(champ_stake, champ_contact)
+        bucket, reasons = _bucket(d, meddic_pct, champion_score)
+        slip = _slip_risk(d, meddic_pct, champion_score)
+
+        buckets[bucket].append({
+            "id": d.id, "name": d.name, "stage": d.stage,
+            "value_usd": d.value_usd or 0,
+            "close_date": str(d.close_date) if d.close_date else None,
+            "meddic_pct": meddic_pct,
+            "meddic_missing": missing[:4],
+            "champion_score": champion_score,
+            "champion_detail": champion_detail,
+            "slip_risk": slip,
+            "reasons": reasons,
+        })
+
+    totals = {
+        b: {
+            "count": len(items),
+            "value": sum(it["value_usd"] for it in items),
+        }
+        for b, items in buckets.items()
+    }
+    return {"buckets": buckets, "totals": totals}
+
+
+# ---- Champion strength on a single deal (used by deal detail) -----
+
+
+@router.get("/deals/{deal_id}/health")
+async def deal_health(deal_id: str):
+    """Per-deal scorecard: MEDDIC fill, champion strength, slip risk,
+    forecast bucket, and rationale. Powers the deal-page header chip."""
+    from ..db.models import Contact, Deal, DealStakeholder
+
+    async with _sm() as s:
+        d = await s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+        sts = (await s.execute(
+            select(DealStakeholder).where(DealStakeholder.deal_id == deal_id)
+        )).scalars().all()
+        champ_stake = next((st for st in sts if st.role == "champion"), None)
+        champ_contact = None
+        if d.champion_id:
+            champ_contact = await s.get(Contact, d.champion_id)
+
+    meddic_pct, missing = _meddic_fill(d)
+    champion_score, champion_detail = _champion_strength(champ_stake, champ_contact)
+    bucket, reasons = _bucket(d, meddic_pct, champion_score)
+    slip = _slip_risk(d, meddic_pct, champion_score)
+    return {
+        "deal_id": deal_id,
+        "meddic_pct": meddic_pct,
+        "meddic_missing": missing,
+        "champion_score": champion_score,
+        "champion_detail": champion_detail,
+        "slip_risk": slip,
+        "forecast_bucket": bucket,
+        "reasons": reasons,
+    }
+
+
+# ---- AI MEDDIC suggester from a meeting ---------------------------
+
+
+_MEDDIC_PROMPT = """You are extracting MEDDIC sales-qualification field updates from a meeting note.
+
+Given the existing deal context and the new meeting summary, suggest updates ONLY for fields where the meeting provides concrete new information. Do NOT invent. Do NOT propose updates without textual evidence.
+
+Output valid JSON in this exact shape:
+{{
+  "metrics": "..." | null,
+  "decision_criteria": "..." | null,
+  "decision_process": "..." | null,
+  "paper_process": "..." | null,
+  "pain": "..." | null,
+  "rationale": "one sentence per non-null field explaining what in the meeting backed it"
+}}
+
+Use null for fields you have no new info on. Keep each field under 200 chars. Be concrete and quotable.
+
+DEAL: {deal_name} (stage: {stage})
+EXISTING MEDDIC:
+- metrics: {metrics}
+- decision_criteria: {dc}
+- decision_process: {dp}
+- paper_process: {pp}
+- pain: {pain}
+
+MEETING ({date}):
+attendees: {attendees}
+summary: {summary}
+decisions: {decisions}
+{transcript_section}
+
+Return JSON only, no prose."""
+
+
+@router.post("/meetings/{meeting_id}/suggest-meddic")
+async def suggest_meddic(meeting_id: str):
+    """LLM extracts proposed MEDDIC field deltas from this meeting +
+    deal context. Returns suggestions only — user reviews and applies."""
+    from ..db.models import Deal, Meeting
+
+    async with _sm() as s:
+        m = await s.get(Meeting, meeting_id)
+        if not m:
+            raise HTTPException(404, "meeting not found")
+        if not m.deal_id:
+            raise HTTPException(400, "meeting has no associated deal")
+        d = await s.get(Deal, m.deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+
+    # Pull the live agent's LLM client — same auth path as the rest of
+    # the system, no separate credentials needed.
+    from .. import main as app_module
+    agent = getattr(app_module, "agent", None)
+    client = getattr(agent, "client", None) if agent else None
+    if client is None:
+        raise HTTPException(503, "LLM not configured")
+
+    transcript_section = (
+        f"transcript excerpt: {(m.transcript or '')[:2000]}"
+        if m.transcript else ""
+    )
+    prompt = _MEDDIC_PROMPT.format(
+        deal_name=d.name, stage=d.stage,
+        metrics=d.metrics or "(empty)",
+        dc=d.decision_criteria or "(empty)",
+        dp=d.decision_process or "(empty)",
+        pp=d.paper_process or "(empty)",
+        pain=d.pain or "(empty)",
+        date=str(m.date), attendees=m.attendees or "(none)",
+        summary=m.summary or "(none)",
+        decisions=m.decisions or "(none)",
+        transcript_section=transcript_section,
+    )
+
+    settings = getattr(app_module, "settings", None)
+    fast_model = getattr(settings, "fast_model", "claude-haiku-4-5") if settings else "claude-haiku-4-5"
+
+    try:
+        resp = await client.messages.create(
+            model=fast_model,
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        raise HTTPException(500, f"LLM call failed: {e}")
+
+    text = ""
+    for block in resp.content:
+        if hasattr(block, "text"):
+            text += block.text
+    text = text.strip()
+    # Strip ```json fences if the model wrapped them
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+    try:
+        suggestions = json.loads(text)
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"LLM returned non-JSON: {text[:200]}")
+
+    # Filter to non-null fields and known keys
+    deltas = {}
+    for k in ("metrics", "decision_criteria", "decision_process", "paper_process", "pain"):
+        v = suggestions.get(k)
+        if v and isinstance(v, str) and v.strip() and v.lower() != "null":
+            deltas[k] = v.strip()
+
+    await _audit("meeting.suggest_meddic", {"meeting_id": meeting_id, "deal_id": d.id},
+                 summary=f"{len(deltas)} suggestions")
+    return {
+        "deal_id": d.id,
+        "meeting_id": meeting_id,
+        "suggestions": deltas,
+        "rationale": suggestions.get("rationale", ""),
+    }
+
+
 @router.get("/chat/{session_id}")
 async def chat_history(session_id: str, limit: int = 50):
     """Recent conversation turns for a session, oldest first.

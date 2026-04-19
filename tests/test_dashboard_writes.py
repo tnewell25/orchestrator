@@ -561,6 +561,93 @@ async def test_chat_history_round_trip(client, session_maker):
 
 
 @pytest.mark.asyncio
+async def test_forecast_buckets_strong_negotiation_to_commit(client, session_maker):
+    """A negotiation-stage deal with high MEDDIC fill and a supportive
+    high-influence champion belongs in Commit. The rationale should
+    explain why so the rep trusts the placement."""
+    from datetime import datetime, timedelta, timezone
+    from orchestrator.db.models import Contact, Deal, DealStakeholder
+
+    async with session_maker() as s:
+        contact = Contact(name="Lena Müller", title="VP Eng",
+                          last_touch=datetime.now(timezone.utc) - timedelta(days=3))
+        s.add(contact)
+        await s.commit()
+        await s.refresh(contact)
+
+        deal = Deal(
+            name="Honeywell DCS Migration",
+            stage="negotiation",
+            value_usd=2_500_000,
+            metrics="Reduce unplanned downtime 18%",
+            decision_criteria="Cybersecurity, lifecycle support, OT vendor lock-in",
+            decision_process="VP Eng → CapEx review → corporate standards committee",
+            paper_process="Legal review T-30, MSA already in place, PO via Ariba",
+            pain="Aging Yokogawa platform, vendor exiting US support 2027",
+            champion_id=contact.id,
+        )
+        s.add(deal)
+        await s.commit()
+        await s.refresh(deal)
+        s.add(DealStakeholder(
+            deal_id=deal.id, contact_id=contact.id,
+            role="champion", sentiment="supportive", influence="high",
+        ))
+        await s.commit()
+
+    forecast = (await client.get("/api/dashboard/forecast")).json()
+    commits = forecast["buckets"]["commit"]
+    assert any(d["name"] == "Honeywell DCS Migration" for d in commits)
+    deal_row = next(d for d in commits if d["name"] == "Honeywell DCS Migration")
+    assert deal_row["champion_score"] >= 90
+    assert deal_row["meddic_pct"] >= 70
+    # No close_date set → +10 slip; pure negotiation base is 15, so ≤30
+    assert deal_row["slip_risk"] <= 30
+    assert len(deal_row["reasons"]) > 0
+
+
+@pytest.mark.asyncio
+async def test_forecast_no_champion_lands_in_pipeline(client, session_maker):
+    """A deal with no champion mapped is structurally at risk regardless
+    of stage. Forecast must reflect that."""
+    from orchestrator.db.models import Deal
+
+    async with session_maker() as s:
+        s.add(Deal(name="Lonely Deal", stage="proposal", value_usd=300_000))
+        await s.commit()
+
+    forecast = (await client.get("/api/dashboard/forecast")).json()
+    pipeline = forecast["buckets"]["pipeline"]
+    assert any(d["name"] == "Lonely Deal" for d in pipeline)
+    deal_row = next(d for d in pipeline if d["name"] == "Lonely Deal")
+    assert deal_row["champion_score"] == 0
+    # Some reason should mention champion
+    assert any("champion" in r.lower() for r in deal_row["reasons"])
+
+
+@pytest.mark.asyncio
+async def test_deal_health_endpoint(client, session_maker):
+    """Per-deal health scorecard for the deal-detail page header."""
+    from orchestrator.db.models import Deal
+
+    async with session_maker() as s:
+        d = Deal(
+            name="Mid Deal", stage="qualified", value_usd=200_000,
+            metrics="some metrics", pain="some pain",
+        )
+        s.add(d)
+        await s.commit()
+        await s.refresh(d)
+
+    health = (await client.get(f"/api/dashboard/deals/{d.id}/health")).json()
+    assert "meddic_pct" in health
+    assert "champion_score" in health
+    assert "forecast_bucket" in health
+    assert "reasons" in health
+    assert health["forecast_bucket"] in ("commit", "best_case", "pipeline")
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include
