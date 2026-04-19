@@ -693,6 +693,100 @@ class ProposalPrecedent(Base):
     created_at = Column(DateTime(timezone=True), default=_now)
 
 
+class Asset(Base):
+    """Installed-base asset at a plant. The Honeywell DCS at Plant X, the
+    AB PLCs at Line 3, the Yokogawa stack the customer is migrating off.
+
+    Drives upsell ('Honeywell exits US support 2027 → migration play'),
+    replacement planning, warranty/spares strategy. The bot can use this
+    for context when the user asks 'what's at Bosch Stuttgart?'.
+    """
+
+    __tablename__ = "assets"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    plant_id = Column(String, ForeignKey("plants.id", ondelete="CASCADE"),
+                      nullable=False, index=True)
+    name = Column(String, nullable=False)
+    manufacturer = Column(String, default="", index=True)  # Honeywell, ABB, Siemens, ...
+    model = Column(String, default="")                      # Experion DCS, S7-1500, ...
+    # asset_type: dcs | plc | hmi | scada | safety_system | drive | motor |
+    #             instrument | network | analyzer | other
+    asset_type = Column(String, default="other", index=True)
+    serial_number = Column(String, default="")
+    quantity = Column(Integer, default=1)
+    installed_date = Column(Date, nullable=True)
+    end_of_life_date = Column(Date, nullable=True, index=True)  # OEM exits / migration trigger
+    # vendor: us | competitor | partner — who installed it / who supports it
+    vendor = Column(String, default="competitor", index=True)
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class CoSeller(Base):
+    """A partner rep co-selling on this deal. The Bosch field engineer
+    sponsoring you internally, the Honeywell rep introducing you, the
+    SI partner you're subbing to.
+
+    Modeling co-sellers explicitly (not as free-text in notes) means
+    commission splits, deal-credit conversations, and partner status
+    are queryable + nudge-able.
+    """
+
+    __tablename__ = "co_sellers"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    deal_id = Column(String, ForeignKey("deals.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    # contact_id is optional — the partner rep may not be in our Contact table
+    # yet (often we know the org but not the individual until kickoff).
+    contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"),
+                        nullable=True)
+    org_name = Column(String, nullable=False)              # Bosch, Honeywell, ABB, ...
+    # role: oem_rep | channel_partner | si_partner | distributor | consultant | reseller
+    role = Column(String, default="oem_rep", index=True)
+    commission_pct = Column(Float, default=0.0)            # our split, 0-100
+    # status: active | introduced | dormant | replaced
+    status = Column(String, default="active", index=True)
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
+class ServiceContract(Base):
+    """Post-install recurring revenue + the renewal cadence.
+
+    PM contracts, 24x7 support, calibration, training. Industrial
+    customers spend 15-25% of CapEx on annual service — modeling
+    contracts means renewals never get missed and lifetime value is
+    visible at the account level.
+    """
+
+    __tablename__ = "service_contracts"
+
+    id = Column(String, primary_key=True, default=_uuid)
+    company_id = Column(String, ForeignKey("companies.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    plant_id = Column(String, ForeignKey("plants.id", ondelete="SET NULL"),
+                      nullable=True, index=True)
+    name = Column(String, nullable=False)                   # "Stuttgart PM 2026"
+    # contract_type: pm_quarterly | pm_annual | 24x7_support | on_call |
+    #                parts_only | training | calibration | other
+    contract_type = Column(String, default="pm_annual", index=True)
+    value_usd_annual = Column(Float, default=0.0)
+    start_date = Column(Date, nullable=True)
+    end_date = Column(Date, nullable=True)
+    renewal_date = Column(Date, nullable=True, index=True)  # when we engage for renewal
+    # status: active | expiring | expired | cancelled | renewed
+    status = Column(String, default="active", index=True)
+    contact_id = Column(String, ForeignKey("contacts.id", ondelete="SET NULL"),
+                        nullable=True)                       # primary contact at customer
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), default=_now)
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+
 class Plant(Base):
     """A physical site / plant belonging to a Company.
 

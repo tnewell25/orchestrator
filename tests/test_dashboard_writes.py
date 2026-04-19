@@ -715,6 +715,119 @@ async def test_deal_audit_filters_by_deal_id(client, session_maker):
 
 
 @pytest.mark.asyncio
+async def test_asset_lifecycle_and_plant_rollup(client, session_maker):
+    """Installed-base asset attached to a plant. Plant detail rolls it up
+    so 'what's at Bosch Stuttgart?' is a one-click answer."""
+    from orchestrator.db.models import Asset
+
+    co = (await client.post("/api/dashboard/companies", json={"name": "Bosch"})).json()
+    plant = (await client.post("/api/dashboard/plants", json={
+        "name": "Stuttgart", "company_id": co["id"], "site_type": "manufacturing",
+    })).json()
+    asset = (await client.post("/api/dashboard/assets", json={
+        "plant_id": plant["id"], "name": "Process unit DCS",
+        "manufacturer": "Honeywell", "model": "Experion PKS",
+        "asset_type": "dcs", "vendor": "competitor",
+        "end_of_life_date": "2027-06-30",
+    })).json()
+
+    # Plant detail includes the asset
+    pd = (await client.get(f"/api/dashboard/plants/{plant['id']}")).json()
+    assert len(pd["assets"]) == 1
+    assert pd["assets"][0]["manufacturer"] == "Honeywell"
+    assert pd["assets"][0]["end_of_life_date"] == "2027-06-30"
+
+    # Update vendor to "us" (we won the migration)
+    await client.patch(f"/api/dashboard/assets/{asset['id']}", json={"vendor": "us"})
+    async with session_maker() as s:
+        a = await s.get(Asset, asset["id"])
+        assert a.vendor == "us"
+
+    # Filter by vendor
+    listed = (await client.get("/api/dashboard/assets", params={"vendor": "us"})).json()
+    assert any(a["id"] == asset["id"] for a in listed["assets"])
+
+
+@pytest.mark.asyncio
+async def test_invalid_asset_type_rejected(client):
+    co = (await client.post("/api/dashboard/companies", json={"name": "X"})).json()
+    plant = (await client.post("/api/dashboard/plants", json={
+        "name": "P", "company_id": co["id"],
+    })).json()
+    r = await client.post("/api/dashboard/assets", json={
+        "plant_id": plant["id"], "name": "X", "asset_type": "invalid",
+    })
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_co_seller_lifecycle(client, session_maker):
+    """Co-seller models the partner rep on the deal — Bosch field engineer
+    sponsoring you internally, etc. Tracking explicitly (not as free-text
+    in notes) means commission splits + status are queryable."""
+    from orchestrator.db.models import CoSeller
+
+    deal = (await client.post("/api/dashboard/deals", json={"name": "Co-sell test"})).json()
+    contact = (await client.post("/api/dashboard/contacts", json={"name": "Hans (Bosch)"})).json()
+
+    cs = (await client.post(f"/api/dashboard/deals/{deal['id']}/co-sellers", json={
+        "org_name": "Bosch", "role": "oem_rep",
+        "contact_id": contact["id"], "commission_pct": 30.0,
+    })).json()
+
+    listed = (await client.get(f"/api/dashboard/deals/{deal['id']}/co-sellers")).json()
+    assert len(listed["co_sellers"]) == 1
+    assert listed["co_sellers"][0]["org_name"] == "Bosch"
+    assert listed["co_sellers"][0]["contact_name"] == "Hans (Bosch)"
+    assert listed["co_sellers"][0]["commission_pct"] == 30.0
+
+    # Patch + delete
+    await client.patch(f"/api/dashboard/co-sellers/{cs['id']}", json={"status": "dormant"})
+    async with session_maker() as s:
+        row = await s.get(CoSeller, cs["id"])
+        assert row.status == "dormant"
+
+    r = await client.delete(f"/api/dashboard/co-sellers/{cs['id']}")
+    assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_service_contract_lifecycle(client):
+    """Renewal date drives ordering — the most-imminent renewal is
+    surfaced first so it never gets missed."""
+    co = (await client.post("/api/dashboard/companies", json={"name": "Honeywell"})).json()
+    plant = (await client.post("/api/dashboard/plants", json={
+        "name": "Site A", "company_id": co["id"],
+    })).json()
+
+    c1 = (await client.post("/api/dashboard/contracts", json={
+        "company_id": co["id"], "plant_id": plant["id"],
+        "name": "Site A PM 2026", "contract_type": "pm_annual",
+        "value_usd_annual": 240_000, "renewal_date": "2026-06-30",
+    })).json()
+    (await client.post("/api/dashboard/contracts", json={
+        "company_id": co["id"],
+        "name": "Distant renewal", "renewal_date": "2027-12-31",
+        "value_usd_annual": 50_000,
+    })).json()
+
+    # List orders by renewal date (most urgent first)
+    listed = (await client.get("/api/dashboard/contracts")).json()
+    contracts = listed["contracts"]
+    assert contracts[0]["name"] == "Site A PM 2026"
+    assert contracts[0]["company"] == "Honeywell"
+    assert contracts[0]["plant"] == "Site A"
+
+    # Filter by company works
+    by_company = (await client.get("/api/dashboard/contracts", params={"company_id": co["id"]})).json()
+    assert all(c["company_id"] == co["id"] for c in by_company["contracts"])
+
+    # Plant detail rolls up the contract
+    pd = (await client.get(f"/api/dashboard/plants/{plant['id']}")).json()
+    assert any(c["id"] == c1["id"] for c in pd["contracts"])
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include

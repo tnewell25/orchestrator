@@ -364,6 +364,18 @@ _SPEC_FAMILIES = {
     "export_control", "quality", "environmental", "other",
 }
 _COMPLIANCE_STATUSES = {"compliant", "partial", "exception", "not_applicable", "unanswered"}
+_ASSET_TYPES = {
+    "dcs", "plc", "hmi", "scada", "safety_system", "drive", "motor",
+    "instrument", "network", "analyzer", "other",
+}
+_ASSET_VENDORS = {"us", "competitor", "partner"}
+_COSELLER_ROLES = {"oem_rep", "channel_partner", "si_partner", "distributor", "consultant", "reseller"}
+_COSELLER_STATUSES = {"active", "introduced", "dormant", "replaced"}
+_CONTRACT_TYPES = {
+    "pm_quarterly", "pm_annual", "24x7_support", "on_call",
+    "parts_only", "training", "calibration", "other",
+}
+_CONTRACT_STATUSES = {"active", "expiring", "expired", "cancelled", "renewed"}
 
 
 # ---- Deals --------------------------------------------------------
@@ -1375,7 +1387,7 @@ async def list_plants(company_id: str = "", q: str = "", limit: int = 100):
 
 @router.get("/plants/{plant_id}")
 async def plant_detail(plant_id: str):
-    from ..db.models import Bid, Company, Contact, Deal, Plant
+    from ..db.models import Asset, Bid, Company, Contact, Deal, Plant, ServiceContract
     async with _sm() as s:
         p = await s.get(Plant, plant_id)
         if not p:
@@ -1391,6 +1403,14 @@ async def plant_detail(plant_id: str):
         bids = (await s.execute(
             select(Bid).where(Bid.plant_id == plant_id)
             .order_by(Bid.submission_deadline.asc().nullslast())
+        )).scalars().all()
+        assets = (await s.execute(
+            select(Asset).where(Asset.plant_id == plant_id)
+            .order_by(Asset.manufacturer, Asset.name)
+        )).scalars().all()
+        contracts = (await s.execute(
+            select(ServiceContract).where(ServiceContract.plant_id == plant_id)
+            .order_by(ServiceContract.renewal_date.asc().nullslast())
         )).scalars().all()
         manager = None
         if p.plant_manager_contact_id:
@@ -1420,6 +1440,22 @@ async def plant_detail(plant_id: str):
              "value_usd": b.value_usd or 0,
              "submission_deadline": b.submission_deadline.isoformat() if b.submission_deadline else None}
             for b in bids
+        ],
+        "assets": [
+            {"id": a.id, "name": a.name,
+             "manufacturer": a.manufacturer, "model": a.model,
+             "asset_type": a.asset_type, "vendor": a.vendor,
+             "quantity": a.quantity,
+             "end_of_life_date": str(a.end_of_life_date) if a.end_of_life_date else None}
+            for a in assets
+        ],
+        "contracts": [
+            {"id": c.id, "name": c.name,
+             "contract_type": c.contract_type,
+             "value_usd_annual": c.value_usd_annual or 0,
+             "renewal_date": str(c.renewal_date) if c.renewal_date else None,
+             "status": c.status}
+            for c in contracts
         ],
     }
 
@@ -2435,5 +2471,416 @@ async def chat_history(session_id: str, limit: int = 50):
             for r in reversed(rows)
         ],
     }
+
+
+# =====================================================================
+# PR8 — Assets (installed base) + CoSellers + ServiceContracts
+# =====================================================================
+
+
+# ---- Assets -------------------------------------------------------
+
+
+@router.get("/assets")
+async def list_assets(
+    plant_id: str = "", manufacturer: str = "", vendor: str = "",
+    q: str = "", limit: int = 200,
+):
+    from ..db.models import Asset, Plant
+    async with _sm() as s:
+        stmt = select(Asset).order_by(Asset.manufacturer, Asset.name).limit(limit)
+        clauses = []
+        if plant_id:
+            clauses.append(Asset.plant_id == plant_id)
+        if manufacturer:
+            clauses.append(Asset.manufacturer.ilike(f"%{manufacturer}%"))
+        if vendor:
+            clauses.append(Asset.vendor == vendor)
+        if q:
+            clauses.append(Asset.name.ilike(f"%{q}%") | Asset.model.ilike(f"%{q}%"))
+        if clauses:
+            stmt = select(Asset).where(*clauses).order_by(Asset.manufacturer, Asset.name).limit(limit)
+        rows = (await s.execute(stmt)).scalars().all()
+        plant_ids = {r.plant_id for r in rows if r.plant_id}
+        plants: dict[str, Plant] = {}
+        if plant_ids:
+            prows = (await s.execute(select(Plant).where(Plant.id.in_(plant_ids)))).scalars().all()
+            plants = {p.id: p for p in prows}
+    return {
+        "assets": [
+            {
+                "id": r.id, "name": r.name,
+                "manufacturer": r.manufacturer, "model": r.model,
+                "asset_type": r.asset_type, "quantity": r.quantity,
+                "vendor": r.vendor,
+                "serial_number": r.serial_number,
+                "installed_date": str(r.installed_date) if r.installed_date else None,
+                "end_of_life_date": str(r.end_of_life_date) if r.end_of_life_date else None,
+                "plant_id": r.plant_id,
+                "plant": plants[r.plant_id].name if r.plant_id in plants else "",
+                "company_id": plants[r.plant_id].company_id if r.plant_id in plants else None,
+                "notes": (r.notes or "")[:200],
+            }
+            for r in rows
+        ],
+    }
+
+
+class AssetCreate(BaseModel):
+    plant_id: str
+    name: str
+    manufacturer: str = ""
+    model: str = ""
+    asset_type: str = "other"
+    serial_number: str = ""
+    quantity: int = 1
+    installed_date: str | None = None
+    end_of_life_date: str | None = None
+    vendor: str = "competitor"
+    notes: str = ""
+
+
+@router.post("/assets")
+async def create_asset(body: AssetCreate):
+    from ..db.models import Asset, Plant
+    if body.asset_type not in _ASSET_TYPES:
+        raise HTTPException(400, f"invalid asset_type: {body.asset_type}")
+    if body.vendor not in _ASSET_VENDORS:
+        raise HTTPException(400, f"invalid vendor: {body.vendor}")
+    async with _sm() as s:
+        if not await s.get(Plant, body.plant_id):
+            raise HTTPException(404, "plant not found")
+        a = Asset(
+            plant_id=body.plant_id, name=body.name,
+            manufacturer=body.manufacturer, model=body.model,
+            asset_type=body.asset_type, serial_number=body.serial_number,
+            quantity=body.quantity,
+            installed_date=_parse_date(body.installed_date),
+            end_of_life_date=_parse_date(body.end_of_life_date),
+            vendor=body.vendor, notes=body.notes,
+        )
+        s.add(a)
+        await s.commit()
+        await s.refresh(a)
+    await _audit("asset.create", body.model_dump(), summary=f"{a.id} {a.name}")
+    return {"id": a.id, "name": a.name}
+
+
+class AssetPatch(BaseModel):
+    name: str | None = None
+    manufacturer: str | None = None
+    model: str | None = None
+    asset_type: str | None = None
+    serial_number: str | None = None
+    quantity: int | None = None
+    installed_date: str | None = None
+    end_of_life_date: str | None = None
+    vendor: str | None = None
+    notes: str | None = None
+    plant_id: str | None = None
+
+
+@router.patch("/assets/{asset_id}")
+async def patch_asset(asset_id: str, body: AssetPatch):
+    from ..db.models import Asset
+    async with _sm() as s:
+        a = await s.get(Asset, asset_id)
+        if not a:
+            raise HTTPException(404, "asset not found")
+        if body.asset_type is not None:
+            if body.asset_type not in _ASSET_TYPES:
+                raise HTTPException(400, f"invalid asset_type: {body.asset_type}")
+            a.asset_type = body.asset_type
+        if body.vendor is not None:
+            if body.vendor not in _ASSET_VENDORS:
+                raise HTTPException(400, f"invalid vendor: {body.vendor}")
+            a.vendor = body.vendor
+        for f in ("name", "manufacturer", "model", "serial_number", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(a, f, v)
+        if body.quantity is not None:
+            a.quantity = body.quantity
+        if body.installed_date is not None:
+            a.installed_date = _parse_date(body.installed_date)
+        if body.end_of_life_date is not None:
+            a.end_of_life_date = _parse_date(body.end_of_life_date)
+        if body.plant_id is not None:
+            a.plant_id = body.plant_id
+        await s.commit()
+    await _audit("asset.patch", {"id": asset_id, **body.model_dump(exclude_none=True)}, summary=asset_id)
+    return {"id": asset_id, "updated": True}
+
+
+@router.delete("/assets/{asset_id}")
+async def delete_asset(asset_id: str):
+    from ..db.models import Asset
+    return await _delete_by_id(Asset, asset_id, "asset.delete", "asset")
+
+
+# ---- Co-sellers (deal-scoped) ------------------------------------
+
+
+@router.get("/deals/{deal_id}/co-sellers")
+async def list_co_sellers(deal_id: str):
+    from ..db.models import Contact, CoSeller
+    async with _sm() as s:
+        rows = (await s.execute(
+            select(CoSeller).where(CoSeller.deal_id == deal_id)
+            .order_by(CoSeller.created_at.asc())
+        )).scalars().all()
+        contact_ids = {r.contact_id for r in rows if r.contact_id}
+        contacts = {}
+        if contact_ids:
+            crows = (await s.execute(select(Contact).where(Contact.id.in_(contact_ids)))).scalars().all()
+            contacts = {c.id: c for c in crows}
+    return {
+        "co_sellers": [
+            {
+                "id": r.id, "deal_id": r.deal_id,
+                "org_name": r.org_name, "role": r.role,
+                "commission_pct": r.commission_pct or 0,
+                "status": r.status,
+                "contact_id": r.contact_id,
+                "contact_name": contacts[r.contact_id].name if r.contact_id in contacts else "",
+                "contact_title": contacts[r.contact_id].title if r.contact_id in contacts else "",
+                "notes": r.notes or "",
+            }
+            for r in rows
+        ],
+    }
+
+
+class CoSellerCreate(BaseModel):
+    org_name: str
+    role: str = "oem_rep"
+    contact_id: str | None = None
+    commission_pct: float = 0.0
+    status: str = "active"
+    notes: str = ""
+
+
+@router.post("/deals/{deal_id}/co-sellers")
+async def create_co_seller(deal_id: str, body: CoSellerCreate):
+    from ..db.models import CoSeller, Deal
+    if body.role not in _COSELLER_ROLES:
+        raise HTTPException(400, f"invalid role: {body.role}")
+    if body.status not in _COSELLER_STATUSES:
+        raise HTTPException(400, f"invalid status: {body.status}")
+    async with _sm() as s:
+        if not await s.get(Deal, deal_id):
+            raise HTTPException(404, "deal not found")
+        cs = CoSeller(
+            deal_id=deal_id, org_name=body.org_name, role=body.role,
+            contact_id=body.contact_id or None,
+            commission_pct=body.commission_pct, status=body.status,
+            notes=body.notes,
+        )
+        s.add(cs)
+        await s.commit()
+        await s.refresh(cs)
+    await _audit("co_seller.create", {"deal_id": deal_id, **body.model_dump()}, summary=cs.id)
+    return {"id": cs.id, "org_name": cs.org_name}
+
+
+class CoSellerPatch(BaseModel):
+    org_name: str | None = None
+    role: str | None = None
+    contact_id: str | None = None
+    commission_pct: float | None = None
+    status: str | None = None
+    notes: str | None = None
+
+
+@router.patch("/co-sellers/{co_seller_id}")
+async def patch_co_seller(co_seller_id: str, body: CoSellerPatch):
+    from ..db.models import CoSeller
+    async with _sm() as s:
+        cs = await s.get(CoSeller, co_seller_id)
+        if not cs:
+            raise HTTPException(404, "co-seller not found")
+        if body.role is not None:
+            if body.role not in _COSELLER_ROLES:
+                raise HTTPException(400, f"invalid role: {body.role}")
+            cs.role = body.role
+        if body.status is not None:
+            if body.status not in _COSELLER_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            cs.status = body.status
+        for f in ("org_name", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(cs, f, v)
+        if body.commission_pct is not None:
+            cs.commission_pct = body.commission_pct
+        if body.contact_id is not None:
+            cs.contact_id = body.contact_id or None
+        await s.commit()
+    await _audit("co_seller.patch", {"id": co_seller_id, **body.model_dump(exclude_none=True)}, summary=co_seller_id)
+    return {"id": co_seller_id, "updated": True}
+
+
+@router.delete("/co-sellers/{co_seller_id}")
+async def delete_co_seller(co_seller_id: str):
+    from ..db.models import CoSeller
+    return await _delete_by_id(CoSeller, co_seller_id, "co_seller.delete", "co-seller")
+
+
+# ---- Service Contracts ---------------------------------------------
+
+
+@router.get("/contracts")
+async def list_contracts(
+    company_id: str = "", plant_id: str = "", status: str = "",
+    limit: int = 200,
+):
+    """Service contracts ordered by renewal date (most urgent first)."""
+    from ..db.models import Company, Plant, ServiceContract
+    async with _sm() as s:
+        clauses = []
+        if company_id:
+            clauses.append(ServiceContract.company_id == company_id)
+        if plant_id:
+            clauses.append(ServiceContract.plant_id == plant_id)
+        if status:
+            if status not in _CONTRACT_STATUSES:
+                raise HTTPException(400, f"invalid status: {status}")
+            clauses.append(ServiceContract.status == status)
+        stmt = select(ServiceContract).order_by(
+            ServiceContract.renewal_date.asc().nullslast()
+        ).limit(limit)
+        if clauses:
+            stmt = select(ServiceContract).where(*clauses).order_by(
+                ServiceContract.renewal_date.asc().nullslast()
+            ).limit(limit)
+        rows = (await s.execute(stmt)).scalars().all()
+        co_ids = {r.company_id for r in rows if r.company_id}
+        plant_ids = {r.plant_id for r in rows if r.plant_id}
+        cos = {}
+        plants = {}
+        if co_ids:
+            crows = (await s.execute(select(Company).where(Company.id.in_(co_ids)))).scalars().all()
+            cos = {c.id: c.name for c in crows}
+        if plant_ids:
+            prows = (await s.execute(select(Plant).where(Plant.id.in_(plant_ids)))).scalars().all()
+            plants = {p.id: p.name for p in prows}
+    return {
+        "contracts": [
+            {
+                "id": r.id, "name": r.name,
+                "contract_type": r.contract_type,
+                "value_usd_annual": r.value_usd_annual or 0,
+                "start_date": str(r.start_date) if r.start_date else None,
+                "end_date": str(r.end_date) if r.end_date else None,
+                "renewal_date": str(r.renewal_date) if r.renewal_date else None,
+                "status": r.status,
+                "company_id": r.company_id, "company": cos.get(r.company_id, ""),
+                "plant_id": r.plant_id, "plant": plants.get(r.plant_id, ""),
+                "notes": (r.notes or "")[:200],
+            }
+            for r in rows
+        ],
+    }
+
+
+class ContractCreate(BaseModel):
+    company_id: str
+    name: str
+    plant_id: str | None = None
+    contract_type: str = "pm_annual"
+    value_usd_annual: float = 0.0
+    start_date: str | None = None
+    end_date: str | None = None
+    renewal_date: str | None = None
+    status: str = "active"
+    contact_id: str | None = None
+    notes: str = ""
+
+
+@router.post("/contracts")
+async def create_contract(body: ContractCreate):
+    from ..db.models import Company, ServiceContract
+    if body.contract_type not in _CONTRACT_TYPES:
+        raise HTTPException(400, f"invalid contract_type: {body.contract_type}")
+    if body.status not in _CONTRACT_STATUSES:
+        raise HTTPException(400, f"invalid status: {body.status}")
+    async with _sm() as s:
+        if not await s.get(Company, body.company_id):
+            raise HTTPException(404, "company not found")
+        c = ServiceContract(
+            company_id=body.company_id, name=body.name,
+            plant_id=body.plant_id or None,
+            contract_type=body.contract_type,
+            value_usd_annual=body.value_usd_annual,
+            start_date=_parse_date(body.start_date),
+            end_date=_parse_date(body.end_date),
+            renewal_date=_parse_date(body.renewal_date),
+            status=body.status,
+            contact_id=body.contact_id or None,
+            notes=body.notes,
+        )
+        s.add(c)
+        await s.commit()
+        await s.refresh(c)
+    await _audit("contract.create", body.model_dump(), summary=f"{c.id} {c.name}")
+    return {"id": c.id, "name": c.name}
+
+
+class ContractPatch(BaseModel):
+    name: str | None = None
+    contract_type: str | None = None
+    value_usd_annual: float | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    renewal_date: str | None = None
+    status: str | None = None
+    contact_id: str | None = None
+    notes: str | None = None
+    plant_id: str | None = None
+    company_id: str | None = None
+
+
+@router.patch("/contracts/{contract_id}")
+async def patch_contract(contract_id: str, body: ContractPatch):
+    from ..db.models import ServiceContract
+    async with _sm() as s:
+        c = await s.get(ServiceContract, contract_id)
+        if not c:
+            raise HTTPException(404, "contract not found")
+        if body.contract_type is not None:
+            if body.contract_type not in _CONTRACT_TYPES:
+                raise HTTPException(400, f"invalid contract_type: {body.contract_type}")
+            c.contract_type = body.contract_type
+        if body.status is not None:
+            if body.status not in _CONTRACT_STATUSES:
+                raise HTTPException(400, f"invalid status: {body.status}")
+            c.status = body.status
+        for f in ("name", "notes"):
+            v = getattr(body, f)
+            if v is not None:
+                setattr(c, f, v)
+        if body.value_usd_annual is not None:
+            c.value_usd_annual = body.value_usd_annual
+        if body.start_date is not None:
+            c.start_date = _parse_date(body.start_date)
+        if body.end_date is not None:
+            c.end_date = _parse_date(body.end_date)
+        if body.renewal_date is not None:
+            c.renewal_date = _parse_date(body.renewal_date)
+        if body.contact_id is not None:
+            c.contact_id = body.contact_id or None
+        if body.plant_id is not None:
+            c.plant_id = body.plant_id or None
+        if body.company_id is not None:
+            c.company_id = body.company_id
+        await s.commit()
+    await _audit("contract.patch", {"id": contract_id, **body.model_dump(exclude_none=True)}, summary=contract_id)
+    return {"id": contract_id, "updated": True}
+
+
+@router.delete("/contracts/{contract_id}")
+async def delete_contract(contract_id: str):
+    from ..db.models import ServiceContract
+    return await _delete_by_id(ServiceContract, contract_id, "contract.delete", "contract")
 
 
