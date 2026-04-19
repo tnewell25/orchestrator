@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     google_credentials_path: str = ""
     google_user_email: str = ""
 
+    # Microsoft Graph (Outlook + Calendar + Teams later) — register an app
+    # in Azure Portal → App registrations. Redirect URI must be:
+    #   {APP_BASE_URL}/auth/microsoft/callback
+    # Permissions (delegated): Calendars.ReadWrite, Mail.ReadWrite, Mail.Send,
+    # User.Read, offline_access
+    microsoft_client_id: str = ""
+    microsoft_client_secret: str = ""
+    # 'common' for any tenant; specific GUID for single-tenant; 'consumers'
+    # for personal accounts only.
+    microsoft_tenant: str = "common"
+    # The base URL the app exposes — needed to construct OAuth redirect URI.
+    app_base_url: str = "https://orchestrator-production-302b.up.railway.app"
+
     # Research (optional — Serper for cleaner google results; DDG scraping fallback)
     serper_api_key: str = ""
 

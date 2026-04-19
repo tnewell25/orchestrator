@@ -3594,3 +3594,92 @@ async def delete_win_loss(r_id: str):
     return await _delete_by_id(WinLossRecord, r_id, "win_loss.delete", "win/loss record")
 
 
+# =====================================================================
+# Integrations — connect/disconnect external services from the UI
+# =====================================================================
+
+
+@router.get("/integrations")
+async def integrations_status():
+    """Per-provider connection status for the /settings/integrations page."""
+    from .. import main as app_module
+    from . import microsoft_auth
+    from ..db.models import OAuthToken
+
+    settings = getattr(app_module, "settings", None)
+
+    # Telegram — bot token presence + allowed users count
+    tg_configured = bool(settings and settings.telegram_bot_token)
+    tg_users = (settings.allowed_user_ids if settings else []) or []
+    telegram = {
+        "id": "telegram",
+        "name": "Telegram",
+        "kind": "chat",
+        "configured": tg_configured,
+        "connected": tg_configured,
+        "detail": (
+            f"{len(tg_users)} authorized user(s)"
+            if tg_configured else "Set TELEGRAM_BOT_TOKEN in env to enable."
+        ),
+    }
+
+    # Google — credentials path presence + token row presence
+    google_configured = bool(settings and settings.google_credentials_path)
+    google_connected = False
+    if google_configured:
+        async with _sm() as s:
+            row = await s.get(OAuthToken, "google")
+            google_connected = bool(row)
+    google = {
+        "id": "google",
+        "name": "Google (Gmail + Calendar)",
+        "kind": "productivity",
+        "configured": google_configured,
+        "connected": google_connected,
+        "detail": (
+            "Connected" if google_connected
+            else ("Set up via Google credentials path" if google_configured else "Set GOOGLE_CREDENTIALS_PATH to enable.")
+        ),
+    }
+
+    # Microsoft Graph
+    ms_status = await microsoft_auth.status()
+    base = (settings.app_base_url if settings else "").rstrip("/")
+    microsoft = {
+        "id": "microsoft",
+        "name": "Microsoft 365 (Outlook + Calendar)",
+        "kind": "productivity",
+        "configured": ms_status.get("configured", False),
+        "connected": ms_status.get("connected", False),
+        "detail": ms_status.get("message") or (
+            "Connected" if ms_status.get("connected") else "Click Connect to authorize."
+        ),
+        "auth_url": f"{base}/auth/microsoft/login" if ms_status.get("configured") else None,
+        "redirect_uri": ms_status.get("redirect_uri"),
+    }
+
+    # Anthropic — read mode from token_manager
+    anthropic_mode = "uninit"
+    tm = getattr(app_module, "token_manager", None)
+    if tm:
+        anthropic_mode = getattr(tm, "mode", "uninit")
+    anthropic = {
+        "id": "anthropic",
+        "name": "Anthropic (LLM)",
+        "kind": "llm",
+        "configured": True,
+        "connected": anthropic_mode != "uninit",
+        "detail": f"Mode: {anthropic_mode}",
+    }
+
+    return {"integrations": [anthropic, telegram, google, microsoft]}
+
+
+@router.post("/integrations/microsoft/disconnect")
+async def integrations_microsoft_disconnect():
+    from . import microsoft_auth
+    await microsoft_auth.disconnect()
+    await _audit("integrations.microsoft.disconnect", {}, summary="microsoft tokens cleared")
+    return {"ok": True}
+
+

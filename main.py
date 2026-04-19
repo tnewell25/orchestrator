@@ -23,6 +23,7 @@ from .core.rule_engine import ActionDispatcher, RuleEngine
 from .core.scheduler_tick import SchedulerTick
 from .core.strategy_fanout import StrategyFanout
 from .interfaces.dashboard_api import mount_dashboard_api
+from .interfaces.microsoft_auth import mount_microsoft_auth
 from .interfaces.webhooks import build_webhook_router
 from .core.proactive_monitor import ProactiveMonitor
 from .core.reminder_service import ReminderService
@@ -39,6 +40,8 @@ from .skills.deal_skill import DealSkill
 from .skills.email_triage_skill import EmailTriageSkill
 from .skills.gmail_skill import GmailSkill
 from .skills.graph_skill import GraphSkill
+from .skills.microsoft_calendar_skill import MicrosoftCalendarSkill
+from .skills.microsoft_mail_skill import MicrosoftMailSkill
 from .skills.job_skill import JobSkill
 from .skills.meeting_skill import MeetingSkill
 from .skills.proposal_skill import ProposalSkill
@@ -171,6 +174,11 @@ async def lifespan(app: FastAPI):
         gmail_skill,
         calendar_skill,
         EmailTriageSkill(sm, gmail_skill=gmail_skill),
+        # Microsoft Graph (Outlook + Calendar). The skills check for a
+        # connected token at call time and return a helpful message when
+        # not connected, so registering them unconditionally is safe.
+        MicrosoftCalendarSkill(),
+        MicrosoftMailSkill(),
         # Field ops (v2 direction — slotted in)
         JobSkill(sm),
     ]
@@ -233,6 +241,7 @@ async def lifespan(app: FastAPI):
     # safer to use mutual TLS or a JWT verifier in front of this.
     app.include_router(build_webhook_router(event_bus))
     mount_dashboard_api(app, sm)
+    mount_microsoft_auth(app, sm, settings)
     logger.info("EventBus + rule engine ready, webhooks + dashboard API mounted")
 
     # 5c. Pipeline Watcher sub-agent — runs nightly via DAILY_SWEEP.
