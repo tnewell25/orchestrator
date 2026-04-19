@@ -667,6 +667,54 @@ async def test_unified_search(client):
 
 
 @pytest.mark.asyncio
+async def test_deal_audit_filters_by_deal_id(client, session_maker):
+    """The per-deal audit log shows tool calls + dashboard mutations
+    that mention this deal_id in their args_summary."""
+    from datetime import datetime, timezone
+    from orchestrator.db.models import AuditLog
+
+    deal = (await client.post("/api/dashboard/deals", json={"name": "AuditTest"})).json()
+    deal_id = deal["id"]
+    other_deal = (await client.post("/api/dashboard/deals", json={"name": "OtherDeal"})).json()
+
+    # Manually insert a few audit rows referencing different deals
+    async with session_maker() as s:
+        s.add(AuditLog(
+            tool_name="bot:deal.update",
+            args_summary=f'{{"deal_id":"{deal_id}","stage":"negotiation"}}',
+            result_status="ok", session_id="telegram",
+            timestamp=datetime.now(timezone.utc),
+        ))
+        s.add(AuditLog(
+            tool_name="bot:reminder.create",
+            args_summary=f'{{"related_deal_id":"{other_deal["id"]}"}}',
+            result_status="ok", session_id="telegram",
+            timestamp=datetime.now(timezone.utc),
+        ))
+        s.add(AuditLog(
+            tool_name="_turn", args_summary="iter=1",
+            result_status="ok", session_id="telegram",
+            timestamp=datetime.now(timezone.utc),
+        ))
+        await s.commit()
+
+    audit = (await client.get(f"/api/dashboard/deals/{deal_id}/audit")).json()
+    items = audit["items"]
+    # We expect: the dashboard:deal.create row + bot:deal.update row
+    tool_names = [it["tool_name"] for it in items]
+    assert "bot:deal.update" in tool_names
+    assert "dashboard:deal.create" in tool_names
+    # Other-deal row should NOT appear
+    assert all("OtherDeal" not in it["args_summary"] and other_deal["id"] not in it["args_summary"] for it in items)
+    # _turn row should NOT appear
+    assert "_turn" not in tool_names
+    # Source classification works
+    sources = {it["source"] for it in items}
+    assert "dashboard" in sources
+    assert "bot" in sources
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include

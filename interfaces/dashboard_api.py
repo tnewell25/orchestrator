@@ -2093,6 +2093,243 @@ async def suggest_meddic(meeting_id: str):
 
 
 # =====================================================================
+# PR7 — Meeting prep brief + per-deal audit log
+# =====================================================================
+
+
+_BRIEF_PROMPT = """You are preparing a sales engineer for an upcoming meeting on this deal.
+
+Generate a TIGHT one-pager (≤400 words) in markdown with these sections:
+
+## Where we are
+One paragraph: deal stage, value, what changed in the last meeting, current next step. Be specific with numbers and names — no fluff.
+
+## Who's in the room (or should be)
+Bullet list of stakeholders: name (role) — sentiment/influence — last touch. Flag missing critical roles (especially: champion, economic buyer, technical buyer).
+
+## What to probe
+3–5 bullets prioritized by MEDDIC gap. For each: what to ask, why it matters. Reference the rep's wedge: industrial sales engineer, Bosch/Honeywell-class buyer.
+
+## Open commitments
+Action items the rep owes back, oldest first. Include due dates.
+
+## Risk + competitor context
+1–2 lines on what's at risk this quarter (slip risk reasoning) and any competitor noise.
+
+## Suggested opener
+ONE punchy sentence the rep can lead with.
+
+Be concrete, opinionated, quotable. Skip empty sections.
+
+DEAL: {name} (stage: {stage}, value: ${value:,.0f}, close: {close_date})
+COMPANY: {company}{plant_section}
+NEXT STEP: {next_step}
+NOTES: {notes}
+COMPETITORS: {competitors}
+
+MEDDIC:
+- metrics: {metrics}
+- economic buyer: {eb}
+- champion: {champion}
+- decision criteria: {dc}
+- decision process: {dp}
+- paper process: {pp}
+- pain: {pain}
+
+STAKEHOLDERS ({n_stake}):
+{stakeholders}
+
+RECENT MEETINGS ({n_meet}):
+{meetings}
+
+OPEN ACTION ITEMS ({n_act}):
+{actions}
+
+ACTIVE BIDS:
+{bids}
+
+Generate the brief now."""
+
+
+@router.post("/deals/{deal_id}/brief")
+async def generate_brief(deal_id: str):
+    """Generate a meeting-prep one-pager for this deal. Returns markdown.
+
+    The persona's wedge — research said this is the single highest-impact
+    'this saves me daily' feature. Pre-meeting brief beats post-meeting
+    recap because it surfaces knowledge AT the moment of need."""
+    from ..db.models import (
+        ActionItem, Bid, Company, Contact, Deal, DealStakeholder, Meeting, Plant,
+    )
+
+    async with _sm() as s:
+        d = await s.get(Deal, deal_id)
+        if not d:
+            raise HTTPException(404, "deal not found")
+        company = await s.get(Company, d.company_id) if d.company_id else None
+        plant = await s.get(Plant, d.plant_id) if d.plant_id else None
+        sts = (await s.execute(
+            select(DealStakeholder).where(DealStakeholder.deal_id == deal_id)
+        )).scalars().all()
+        contact_ids = {st.contact_id for st in sts}
+        contacts = {}
+        if contact_ids:
+            crows = (await s.execute(
+                select(Contact).where(Contact.id.in_(contact_ids))
+            )).scalars().all()
+            contacts = {c.id: c for c in crows}
+        meetings = (await s.execute(
+            select(Meeting).where(Meeting.deal_id == deal_id)
+            .order_by(Meeting.date.desc()).limit(5)
+        )).scalars().all()
+        actions = (await s.execute(
+            select(ActionItem).where(
+                ActionItem.deal_id == deal_id, ActionItem.status == "open"
+            ).order_by(ActionItem.created_at.asc())
+        )).scalars().all()
+        bids = (await s.execute(
+            select(Bid).where(Bid.deal_id == deal_id)
+            .order_by(Bid.submission_deadline.asc().nullslast())
+        )).scalars().all()
+        eb_contact = await s.get(Contact, d.economic_buyer_id) if d.economic_buyer_id else None
+        ch_contact = await s.get(Contact, d.champion_id) if d.champion_id else None
+
+    # Render compact context for the prompt
+    def _stake_line(st):
+        c = contacts.get(st.contact_id)
+        name = c.name if c else "(unknown contact)"
+        title = c.title if c else ""
+        last_touch = ""
+        if c and c.last_touch:
+            from datetime import datetime as _dt, timezone as _tz
+            now = _dt.now(_tz.utc)
+            lt = c.last_touch if c.last_touch.tzinfo else c.last_touch.replace(tzinfo=_tz.utc)
+            days = max(0, (now - lt).days)
+            last_touch = f", last touch {days}d ago"
+        return f"- {name} ({st.role}, {st.sentiment}/{st.influence} influence{last_touch}){' — ' + title if title else ''}"
+
+    stake_block = "\n".join(_stake_line(st) for st in sts) if sts else "(none mapped — significant risk)"
+    meet_block = "\n".join(
+        f"- {str(m.date)[:10]} ({m.attendees or 'no attendees'}): "
+        f"{(m.summary or '')[:200]}"
+        + (f" | decisions: {(m.decisions or '')[:120]}" if m.decisions else "")
+        for m in meetings
+    ) or "(no meetings logged)"
+    act_block = "\n".join(
+        f"- {a.description[:200]}"
+        + (f" (due {str(a.due_date)})" if a.due_date else " (no due date)")
+        for a in actions[:10]
+    ) or "(none)"
+    bid_block = "\n".join(
+        f"- {b.name} [{b.stage}] ${(b.value_usd or 0):,.0f}"
+        + (f" deadline {b.submission_deadline.isoformat()[:10]}" if b.submission_deadline else "")
+        for b in bids if b.stage in ("evaluating", "in_progress", "submitted")
+    ) or "(none active)"
+
+    plant_section = f" — Plant: {plant.name}" if plant else ""
+
+    prompt = _BRIEF_PROMPT.format(
+        name=d.name, stage=d.stage, value=d.value_usd or 0,
+        close_date=str(d.close_date) if d.close_date else "no date",
+        company=company.name if company else "(no company)",
+        plant_section=plant_section,
+        next_step=d.next_step or "(none)",
+        notes=(d.notes or "(none)")[:600],
+        competitors=d.competitors or "(none on file)",
+        metrics=d.metrics or "(empty)",
+        eb=eb_contact.name if eb_contact else "(unmapped)",
+        champion=ch_contact.name if ch_contact else "(unmapped)",
+        dc=d.decision_criteria or "(empty)",
+        dp=d.decision_process or "(empty)",
+        pp=d.paper_process or "(empty)",
+        pain=d.pain or "(empty)",
+        n_stake=len(sts),
+        stakeholders=stake_block,
+        n_meet=len(meetings),
+        meetings=meet_block,
+        n_act=len(actions),
+        actions=act_block,
+        bids=bid_block,
+    )
+
+    from .. import main as app_module
+    agent = getattr(app_module, "agent", None)
+    client = getattr(agent, "client", None) if agent else None
+    if client is None:
+        raise HTTPException(503, "LLM not configured")
+
+    settings = getattr(app_module, "settings", None)
+    # Use a stronger model for the brief — this is the rep's actual prep doc,
+    # not a quick extraction. fast_model is fine, but allow override.
+    model = getattr(settings, "fast_model", "claude-haiku-4-5") if settings else "claude-haiku-4-5"
+
+    try:
+        resp = await client.messages.create(
+            model=model,
+            max_tokens=1200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        raise HTTPException(500, f"LLM call failed: {e}")
+
+    text = ""
+    for block in resp.content:
+        if hasattr(block, "text"):
+            text += block.text
+
+    await _audit("deal.brief", {"deal_id": deal_id}, summary=f"{len(text)} chars")
+    return {"deal_id": deal_id, "brief_md": text.strip()}
+
+
+# ---- Per-deal audit log -------------------------------------------
+
+
+@router.get("/deals/{deal_id}/audit")
+async def deal_audit(deal_id: str, limit: int = 100):
+    """Chronological tool-call + dashboard-mutation history for this deal.
+
+    Filtering is done with a LIKE on args_summary (which contains the
+    JSON-encoded tool args). Not perfect — false positives possible if
+    a tool call mentions this deal_id incidentally — but good enough
+    for a debugging/trust surface."""
+    from ..db.models import AuditLog
+
+    async with _sm() as s:
+        rows = (await s.execute(
+            select(AuditLog)
+            .where(
+                AuditLog.tool_name != "_turn",  # exclude per-turn token rows
+                # Search both args (where the deal_id usually lives in tool
+                # input) and result_summary (where dashboard create-style
+                # ops put the new entity id).
+                AuditLog.args_summary.contains(deal_id) | AuditLog.result_summary.contains(deal_id),
+            )
+            .order_by(AuditLog.timestamp.desc())
+            .limit(limit)
+        )).scalars().all()
+
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "timestamp": str(r.timestamp),
+                "tool_name": r.tool_name,
+                "args_summary": r.args_summary[:300],
+                "result_status": r.result_status,
+                "result_summary": (r.result_summary or "")[:200],
+                "session_id": r.session_id,
+                "duration_ms": r.duration_ms,
+                "safety": r.safety,
+                "source": "dashboard" if r.tool_name.startswith("dashboard:") else (
+                    "bot" if r.session_id != "dashboard" else "system"
+                ),
+            }
+            for r in rows
+        ],
+    }
+
+
+# =====================================================================
 # PR6 — unified search for the Cmd-K palette. One round-trip across
 # every searchable entity instead of fanning out 5 requests.
 # =====================================================================
