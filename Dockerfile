@@ -6,10 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps for fastembed (ONNX) and asyncpg
+# System deps:
+# - build-essential / libgomp1 → fastembed (ONNX) + asyncpg
+# - ffmpeg → audio_processor chunking long meeting recordings (>25MB) into
+#   10-min segments before sending to Whisper (which has a 25MB hard cap).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgomp1 \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./

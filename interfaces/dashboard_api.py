@@ -3696,7 +3696,10 @@ async def integrations_microsoft_disconnect():
 # =====================================================================
 
 
-_AUDIO_MAX_BYTES = 25 * 1024 * 1024  # Whisper's hard cap is 25MB
+# Generous limit — actual transcription handles chunking internally (pydub +
+# ffmpeg splits into 10-min mp3 segments before sending to Whisper). 500MB
+# covers ~12 hours of typical voice-memo audio.
+_AUDIO_MAX_BYTES = 500 * 1024 * 1024
 
 
 async def _process_audio_upload(meeting_id: str, file: UploadFile) -> dict:

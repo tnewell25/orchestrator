@@ -1,18 +1,20 @@
 """Audio → transcript → categorization pipeline.
 
-Single entry point: `process_audio(meeting_id, audio_bytes, filename)`.
+Single entry point: `process_meeting_audio(meeting_id, audio_bytes, filename)`.
 Pipeline:
-  1. POST audio to OpenAI Whisper API → transcript text
-  2. LLM categorization pass (Haiku) → meeting_type, sentiment, attendees,
-     decisions, action items, MEDDIC deltas, competitors, pricing
-  3. Persist transcript + categorization fields to the Meeting row
-  4. Discard raw audio (transcript IS the audit; saves storage + GDPR)
+  1. If file >25MB, chunk it via pydub/ffmpeg into 10-min segments
+  2. POST each chunk to OpenAI Whisper API in parallel (asyncio.gather)
+  3. Concatenate transcripts in order
+  4. LLM categorization pass (Haiku) on the combined transcript
+  5. Persist transcript + categorization fields to the Meeting row
+  6. Discard raw audio (transcript IS the audit; saves storage + GDPR)
 
-Runs synchronously in the request for files <10MB. Larger files should
-be queued via JobQueue (not yet wired here — defer to Phase 2).
+Whisper hard caps at 25MB per file. We chunk to 22MB safety margin.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import logging
 from typing import Any
@@ -20,6 +22,11 @@ from typing import Any
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Whisper's 25MB cap with safety margin. 10-min chunks at OpenAI's recommended
+# bitrates land comfortably under this even for high-quality recordings.
+_CHUNK_MAX_BYTES = 22 * 1024 * 1024
+_CHUNK_DURATION_MS = 10 * 60 * 1000  # 10 minutes per chunk
 
 
 _CATEGORIZE_PROMPT = """You are categorizing a sales meeting transcript for a senior industrial sales engineer (think Bosch / Honeywell-class buyers).
@@ -65,25 +72,88 @@ TRANSCRIPT:
 Return JSON only."""
 
 
-async def transcribe_audio(audio_bytes: bytes, filename: str, openai_api_key: str) -> str:
-    """Upload audio to OpenAI Whisper API, return the transcript text.
+async def _whisper_one(client: httpx.AsyncClient, audio_bytes: bytes, filename: str, key: str) -> str:
+    """Single Whisper API call. Caller handles chunking + concatenation."""
+    files = {"file": (filename, audio_bytes, "application/octet-stream")}
+    data = {"model": "whisper-1", "response_format": "text"}
+    headers = {"Authorization": f"Bearer {key}"}
+    r = await client.post(
+        "https://api.openai.com/v1/audio/transcriptions",
+        files=files, data=data, headers=headers,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Whisper API error {r.status_code}: {r.text[:300]}")
+    return r.text.strip()
 
-    Whisper accepts mp3/mp4/mpeg/mpga/m4a/wav/webm up to 25 MB.
+
+def _chunk_audio_via_ffmpeg(audio_bytes: bytes, src_filename: str) -> list[tuple[bytes, str]]:
+    """Split a >25MB audio file into 10-min mp3 chunks via pydub/ffmpeg.
+
+    Returns list of (bytes, filename) tuples in time order. Re-encodes
+    to mp3 64kbps mono (Whisper-recommended) which dramatically reduces
+    file size — a 60-min recording at this bitrate is ~28MB total split
+    across 6 chunks of ~5MB each.
+    """
+    from pydub import AudioSegment
+
+    # Infer format from filename extension; pydub falls back to ffmpeg for
+    # any container ffmpeg can read (m4a, mp3, wav, webm, ogg, mp4, flac, …).
+    ext = (src_filename.rsplit(".", 1)[-1] if "." in src_filename else "").lower() or "mp3"
+    audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format=ext)
+
+    # Whisper-friendly settings: 16kHz mono, mp3 64kbps. Drops file size
+    # by ~5-10x vs original without hurting transcription quality.
+    audio = audio.set_channels(1).set_frame_rate(16000)
+
+    chunks: list[tuple[bytes, str]] = []
+    n_chunks = max(1, (len(audio) + _CHUNK_DURATION_MS - 1) // _CHUNK_DURATION_MS)
+    for i in range(n_chunks):
+        start = i * _CHUNK_DURATION_MS
+        end = min(start + _CHUNK_DURATION_MS, len(audio))
+        segment = audio[start:end]
+        buf = io.BytesIO()
+        segment.export(buf, format="mp3", bitrate="64k", parameters=["-ac", "1"])
+        chunks.append((buf.getvalue(), f"chunk-{i+1:03d}.mp3"))
+    return chunks
+
+
+async def transcribe_audio(audio_bytes: bytes, filename: str, openai_api_key: str) -> str:
+    """Transcribe via OpenAI Whisper. Auto-chunks files >25MB.
+
+    For long recordings (multi-hour plant walkdowns), pydub+ffmpeg splits
+    into 10-min chunks, Whisper runs them in parallel, transcripts are
+    concatenated in time order. A 2-hour recording goes through 12 chunks
+    in roughly the time of the longest single chunk (~30s each).
     """
     if not openai_api_key:
         raise ValueError("OPENAI_API_KEY not configured — required for transcription")
 
-    async with httpx.AsyncClient(timeout=180) as c:
-        files = {"file": (filename, audio_bytes, "application/octet-stream")}
-        data = {"model": "whisper-1", "response_format": "text"}
-        headers = {"Authorization": f"Bearer {openai_api_key}"}
-        r = await c.post(
-            "https://api.openai.com/v1/audio/transcriptions",
-            files=files, data=data, headers=headers,
+    async with httpx.AsyncClient(timeout=300) as c:
+        # Single-shot path for small files — avoids ffmpeg overhead.
+        if len(audio_bytes) <= _CHUNK_MAX_BYTES:
+            return await _whisper_one(c, audio_bytes, filename, openai_api_key)
+
+        # Chunk + parallel transcribe. Run ffmpeg work in a thread executor
+        # since pydub is blocking and we don't want to stall the event loop.
+        logger.info("Audio %s is %.1fMB — chunking before Whisper",
+                    filename, len(audio_bytes) / 1024 / 1024)
+        loop = asyncio.get_event_loop()
+        chunks = await loop.run_in_executor(None, _chunk_audio_via_ffmpeg, audio_bytes, filename)
+        logger.info("Split into %d chunks", len(chunks))
+
+        results = await asyncio.gather(
+            *(_whisper_one(c, b, name, openai_api_key) for (b, name) in chunks),
+            return_exceptions=True,
         )
-        if r.status_code != 200:
-            raise RuntimeError(f"Whisper API error {r.status_code}: {r.text[:300]}")
-        return r.text.strip()
+
+        transcript_parts = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                logger.error("Chunk %d failed: %s", i + 1, r)
+                transcript_parts.append(f"[chunk {i+1} transcription failed]")
+            else:
+                transcript_parts.append(r)
+        return "\n\n".join(transcript_parts)
 
 
 async def categorize_transcript(

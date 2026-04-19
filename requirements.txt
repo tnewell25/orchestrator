@@ -31,6 +31,10 @@ google-auth-httplib2>=0.2.0
 # Voice transcription (Whisper via OpenAI)
 openai>=1.30.0
 
+# Audio chunking — split long meeting recordings into <25MB segments
+# before sending to Whisper. Wraps ffmpeg (installed via Dockerfile).
+pydub>=0.25.1
+
 # Natural-language date parsing for reminders ("in 2 hours", "tomorrow 3pm")
 python-dateutil>=2.8.2
 dateparser>=1.2.0
