@@ -63,6 +63,11 @@ Rules:
 - competitors_mentioned: only proper noun company names (Siemens, Yokogawa, ABB, etc).
 - Be conservative — empty arrays/null are better than hallucinated content.
 
+If the transcript has 'Speaker 0:', 'Speaker 1:' etc (diarized), use them to:
+- Distinguish what THE REP committed to (action_items owner='us') vs what THE CUSTOMER committed to (owner='customer')
+- Attribute MEDDIC pain/criteria to whoever stated it (more reliable signal when the customer says it)
+- Identify the EB/champion by who's leading the conversation vs who defers to whom
+
 DEAL CONTEXT:
 {deal_context}
 
@@ -84,6 +89,90 @@ async def _whisper_one(client: httpx.AsyncClient, audio_bytes: bytes, filename: 
     if r.status_code != 200:
         raise RuntimeError(f"Whisper API error {r.status_code}: {r.text[:300]}")
     return r.text.strip()
+
+
+async def _transcribe_via_deepgram(
+    audio_bytes: bytes, filename: str, api_key: str, model: str = "nova-3",
+) -> str:
+    """Deepgram prerecorded transcription with speaker diarization.
+
+    Better than Whisper for our use case:
+    - No file-size cap (Whisper hard-caps at 25MB)
+    - Speaker diarization: knows who said what — huge for MEDDIC quality
+    - ~30% cheaper for long-form ($0.0043/min vs Whisper's $0.006/min)
+    - 2-5x faster
+
+    Output is formatted as 'Speaker N: utterance' blocks so the
+    categorizer can distinguish rep speech from customer speech.
+    """
+    # Infer Content-Type from filename so Deepgram can decode any container
+    ext = (filename.rsplit(".", 1)[-1] if "." in filename else "").lower()
+    mime = {
+        "mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/m4a",
+        "mp4": "audio/mp4", "webm": "audio/webm", "ogg": "audio/ogg",
+        "oga": "audio/ogg", "opus": "audio/opus", "flac": "audio/flac",
+        "aac": "audio/aac",
+    }.get(ext, "application/octet-stream")
+
+    params = {
+        "model": model,
+        "smart_format": "true",
+        "diarize": "true",
+        "punctuate": "true",
+        "paragraphs": "true",
+        "utterances": "true",
+        "language": "en",
+    }
+    headers = {
+        "Authorization": f"Token {api_key}",
+        "Content-Type": mime,
+    }
+
+    # Long uploads + long server-side processing — generous timeout
+    async with httpx.AsyncClient(timeout=600) as c:
+        r = await c.post(
+            "https://api.deepgram.com/v1/listen",
+            params=params, headers=headers, content=audio_bytes,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Deepgram error {r.status_code}: {r.text[:300]}")
+        body = r.json()
+
+    # Format the transcript with speaker labels. Group consecutive
+    # words/utterances by speaker so the output reads like a script.
+    try:
+        utterances = body["results"].get("utterances", [])
+        if utterances:
+            lines = []
+            current_speaker = None
+            current_text: list[str] = []
+            for u in utterances:
+                spk = u.get("speaker", 0)
+                if spk != current_speaker and current_text:
+                    lines.append(f"Speaker {current_speaker}: {' '.join(current_text)}")
+                    current_text = []
+                current_speaker = spk
+                current_text.append(u.get("transcript", "").strip())
+            if current_text:
+                lines.append(f"Speaker {current_speaker}: {' '.join(current_text)}")
+            return "\n\n".join(l for l in lines if l).strip()
+
+        # Fallback: paragraphs without diarization
+        paragraphs = body["results"]["channels"][0]["alternatives"][0].get("paragraphs", {})
+        if paragraphs:
+            text = paragraphs.get("transcript", "")
+            if text:
+                return text.strip()
+
+        # Last fallback: flat transcript
+        return body["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
+    except (KeyError, IndexError) as e:
+        logger.warning("Deepgram response shape unexpected: %s", e)
+        # Try the simplest extraction
+        try:
+            return body["results"]["channels"][0]["alternatives"][0]["transcript"].strip()
+        except Exception:
+            raise RuntimeError("Deepgram returned no usable transcript")
 
 
 def _chunk_audio_via_ffmpeg(audio_bytes: bytes, src_filename: str) -> list[tuple[bytes, str]]:
@@ -117,24 +206,41 @@ def _chunk_audio_via_ffmpeg(audio_bytes: bytes, src_filename: str) -> list[tuple
     return chunks
 
 
-async def transcribe_audio(audio_bytes: bytes, filename: str, openai_api_key: str) -> str:
-    """Transcribe via OpenAI Whisper. Auto-chunks files >25MB.
+async def transcribe_audio(
+    audio_bytes: bytes,
+    filename: str,
+    openai_api_key: str = "",
+    deepgram_api_key: str = "",
+    deepgram_model: str = "nova-3",
+) -> str:
+    """Transcribe an audio file. Routes to the best available backend.
 
-    For long recordings (multi-hour plant walkdowns), pydub+ffmpeg splits
-    into 10-min chunks, Whisper runs them in parallel, transcripts are
-    concatenated in time order. A 2-hour recording goes through 12 chunks
-    in roughly the time of the longest single chunk (~30s each).
+    Preferred: Deepgram (no size cap, speaker diarization, faster, cheaper).
+    Fallback: OpenAI Whisper with pydub/ffmpeg chunking for files >22MB.
+
+    The output transcript may include 'Speaker N:' labels when Deepgram
+    diarization is used — the categorizer prompt knows how to read these.
     """
+    if deepgram_api_key:
+        logger.info("Transcribing %.1fMB via Deepgram (%s, diarized)",
+                    len(audio_bytes) / 1024 / 1024, deepgram_model)
+        return await _transcribe_via_deepgram(
+            audio_bytes, filename, deepgram_api_key, deepgram_model,
+        )
+
     if not openai_api_key:
-        raise ValueError("OPENAI_API_KEY not configured — required for transcription")
+        raise ValueError(
+            "No transcription backend configured. Set DEEPGRAM_API_KEY "
+            "(preferred) or OPENAI_API_KEY."
+        )
 
     async with httpx.AsyncClient(timeout=300) as c:
-        # Single-shot path for small files — avoids ffmpeg overhead.
+        # Single-shot Whisper for small files — avoids ffmpeg overhead.
         if len(audio_bytes) <= _CHUNK_MAX_BYTES:
             return await _whisper_one(c, audio_bytes, filename, openai_api_key)
 
-        # Chunk + parallel transcribe. Run ffmpeg work in a thread executor
-        # since pydub is blocking and we don't want to stall the event loop.
+        # Chunk + parallel transcribe via Whisper (legacy path when only
+        # Whisper is configured). Deepgram avoids this entirely.
         logger.info("Audio %s is %.1fMB — chunking before Whisper",
                     filename, len(audio_bytes) / 1024 / 1024)
         loop = asyncio.get_event_loop()
@@ -195,14 +301,16 @@ async def process_meeting_audio(
     filename: str,
     session_maker,
     llm_client,
-    openai_api_key: str,
+    openai_api_key: str = "",
+    deepgram_api_key: str = "",
+    deepgram_model: str = "nova-3",
     fast_model: str = "claude-haiku-4-5",
 ) -> dict[str, Any]:
     """End-to-end: transcribe + categorize + persist. Returns the Meeting
     row's updated state + the raw extracted suggestions.
 
-    This runs synchronously. For files >10MB or transcripts likely >5 min,
-    callers should hand off to the job queue instead.
+    Deepgram is preferred when configured (no size cap, speaker diarization).
+    Whisper is the fallback (with pydub/ffmpeg chunking for >22MB files).
     """
     from sqlalchemy import select
     from ..db.models import Deal, Meeting
@@ -216,9 +324,14 @@ async def process_meeting_audio(
         m.audio_processing_error = ""
         await s.commit()
 
-    # Step 1 — transcribe
+    # Step 1 — transcribe (Deepgram preferred, Whisper fallback)
     try:
-        transcript = await transcribe_audio(audio_bytes, filename, openai_api_key)
+        transcript = await transcribe_audio(
+            audio_bytes, filename,
+            openai_api_key=openai_api_key,
+            deepgram_api_key=deepgram_api_key,
+            deepgram_model=deepgram_model,
+        )
     except Exception as e:
         async with session_maker() as s:
             m = await s.get(Meeting, meeting_id)

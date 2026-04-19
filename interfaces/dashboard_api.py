@@ -3711,8 +3711,9 @@ async def _process_audio_upload(meeting_id: str, file: UploadFile) -> dict:
     agent = getattr(app_module, "agent", None)
     llm_client = getattr(agent, "client", None) if agent else None
 
-    if not settings or not settings.openai_api_key:
-        raise HTTPException(503, "OPENAI_API_KEY not configured — required for transcription")
+    has_stt = settings and (settings.deepgram_api_key or settings.openai_api_key)
+    if not has_stt:
+        raise HTTPException(503, "No transcription backend — set DEEPGRAM_API_KEY (preferred) or OPENAI_API_KEY")
     if llm_client is None:
         raise HTTPException(503, "Agent LLM not ready")
 
@@ -3731,6 +3732,8 @@ async def _process_audio_upload(meeting_id: str, file: UploadFile) -> dict:
             session_maker=_sm,
             llm_client=llm_client,
             openai_api_key=settings.openai_api_key,
+            deepgram_api_key=settings.deepgram_api_key,
+            deepgram_model=getattr(settings, "deepgram_model", "nova-3"),
             fast_model=fast_model,
         )
     except Exception as e:

@@ -196,9 +196,10 @@ class TelegramBot:
         self.owner_chat_id = update.effective_chat.id
         session_id = self._session_id(uid)
 
-        if not self.settings.openai_api_key:
+        has_stt = self.settings.deepgram_api_key or self.settings.openai_api_key
+        if not has_stt:
             await update.message.reply_text(
-                "Voice transcription disabled — set OPENAI_API_KEY to enable."
+                "Voice transcription disabled — set DEEPGRAM_API_KEY (preferred) or OPENAI_API_KEY."
             )
             return
 
@@ -272,21 +273,25 @@ class TelegramBot:
             await update.message.reply_text(f"Error: {str(e)[:200]}")
 
     async def _transcribe(self, path: str) -> str:
-        """Whisper via OpenAI. Uses a thread executor to avoid blocking."""
-        import asyncio
+        """Transcribe via Deepgram (preferred) or Whisper (fallback).
 
-        from openai import AsyncOpenAI
-
-        client = AsyncOpenAI(api_key=self.settings.openai_api_key)
+        Deepgram has speaker diarization (knows who said who), no file-size
+        cap, and is ~30% cheaper. Whisper is the legacy path when only
+        OPENAI_API_KEY is set.
+        """
         try:
             with open(path, "rb") as f:
-                result = await client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                )
-            return result.text or ""
+                audio_bytes = f.read()
+            from ..core.audio_processor import transcribe_audio
+            return await transcribe_audio(
+                audio_bytes,
+                filename=os.path.basename(path),
+                openai_api_key=self.settings.openai_api_key,
+                deepgram_api_key=self.settings.deepgram_api_key,
+                deepgram_model=getattr(self.settings, "deepgram_model", "nova-3"),
+            )
         except Exception as e:
-            logger.error(f"Whisper error: {e}", exc_info=True)
+            logger.error(f"Transcription error: {e}", exc_info=True)
             return ""
 
     async def _on_photo(self, update: Update, context):

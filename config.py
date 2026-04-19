@@ -43,7 +43,15 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     telegram_allowed_users: str = ""  # comma-separated user IDs
 
-    # Voice transcription
+    # Voice transcription. Two backends supported:
+    #
+    # 1. Deepgram (preferred when set) — handles arbitrary-length files
+    #    natively, ~30% cheaper than Whisper, includes speaker diarization
+    #    (knows who said what — huge for MEDDIC extraction quality).
+    # 2. OpenAI Whisper (fallback) — 25MB cap, server-side chunking via
+    #    pydub+ffmpeg handles longer files.
+    deepgram_api_key: str = ""
+    deepgram_model: str = "nova-3"
     openai_api_key: str = ""
 
     # Google (Gmail + Calendar)
