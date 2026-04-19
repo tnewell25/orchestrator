@@ -648,6 +648,25 @@ async def test_deal_health_endpoint(client, session_maker):
 
 
 @pytest.mark.asyncio
+async def test_unified_search(client):
+    """Cmd-K palette hits one endpoint that returns matches across
+    every entity type — no client-side fan-out."""
+    co = (await client.post("/api/dashboard/companies", json={"name": "Bosch"})).json()
+    await client.post("/api/dashboard/deals", json={"name": "Bosch Forge", "company_id": co["id"]})
+    await client.post("/api/dashboard/contacts", json={"name": "Brian Bosch"})
+    await client.post("/api/dashboard/bids", json={"name": "Bosch RFP-2026"})
+    await client.post("/api/dashboard/plants", json={"name": "Bosch Stuttgart", "company_id": co["id"]})
+
+    r = (await client.get("/api/dashboard/search", params={"q": "bosch"})).json()
+    kinds = {item["kind"] for item in r["results"]}
+    assert kinds == {"deal", "contact", "company", "bid", "plant"}
+
+    # Empty query returns nothing
+    empty = (await client.get("/api/dashboard/search", params={"q": ""})).json()
+    assert empty["results"] == []
+
+
+@pytest.mark.asyncio
 async def test_industrial_stakeholder_roles_accepted(client):
     """The expanded role taxonomy (ot_cyber, parent_company_standards, etc.)
     must be valid post-PR1 — buying committees in industrial sales include

@@ -2092,6 +2092,82 @@ async def suggest_meddic(meeting_id: str):
     }
 
 
+# =====================================================================
+# PR6 — unified search for the Cmd-K palette. One round-trip across
+# every searchable entity instead of fanning out 5 requests.
+# =====================================================================
+
+
+@router.get("/search")
+async def search(q: str, limit: int = 8):
+    """Search deals/contacts/companies/bids/plants by name in a single
+    pass. Returns up to `limit` per entity type. Empty `q` returns
+    nothing (palette is intent-driven; pre-loading everything would be
+    noise)."""
+    from ..db.models import Bid, Company, Contact, Deal, Plant
+
+    q_str = (q or "").strip()
+    if not q_str:
+        return {"results": []}
+    pat = f"%{q_str}%"
+
+    async with _sm() as s:
+        deals = (await s.execute(
+            select(Deal).where(Deal.name.ilike(pat))
+            .order_by(Deal.updated_at.desc().nullslast()).limit(limit)
+        )).scalars().all()
+        contacts = (await s.execute(
+            select(Contact).where(
+                Contact.name.ilike(pat) | Contact.email.ilike(pat)
+            ).limit(limit)
+        )).scalars().all()
+        companies = (await s.execute(
+            select(Company).where(Company.name.ilike(pat))
+            .order_by(Company.name).limit(limit)
+        )).scalars().all()
+        bids = (await s.execute(
+            select(Bid).where(Bid.name.ilike(pat))
+            .order_by(Bid.submission_deadline.asc().nullslast()).limit(limit)
+        )).scalars().all()
+        plants = (await s.execute(
+            select(Plant).where(Plant.name.ilike(pat))
+            .order_by(Plant.name).limit(limit)
+        )).scalars().all()
+
+    results: list[dict] = []
+    for d in deals:
+        results.append({
+            "kind": "deal", "id": d.id, "title": d.name,
+            "subtitle": f"{d.stage} · ${(d.value_usd or 0):,.0f}",
+            "href": f"/deals/{d.id}",
+        })
+    for c in contacts:
+        results.append({
+            "kind": "contact", "id": c.id, "title": c.name,
+            "subtitle": c.title or c.email or "",
+            "href": "/contacts",
+        })
+    for co in companies:
+        results.append({
+            "kind": "company", "id": co.id, "title": co.name,
+            "subtitle": co.industry or "",
+            "href": f"/companies/{co.id}",
+        })
+    for b in bids:
+        results.append({
+            "kind": "bid", "id": b.id, "title": b.name,
+            "subtitle": f"{b.stage} · ${(b.value_usd or 0):,.0f}",
+            "href": f"/bids/{b.id}",
+        })
+    for p in plants:
+        results.append({
+            "kind": "plant", "id": p.id, "title": p.name,
+            "subtitle": p.site_address or p.site_type,
+            "href": f"/plants/{p.id}",
+        })
+    return {"results": results}
+
+
 @router.get("/chat/{session_id}")
 async def chat_history(session_id: str, limit: int = 50):
     """Recent conversation turns for a session, oldest first.
