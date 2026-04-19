@@ -11,7 +11,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy import func, select, desc
 
@@ -190,7 +190,13 @@ async def deal_detail(deal_id: str):
         ],
         "meetings": [
             {"id": m.id, "date": str(m.date), "summary": m.summary,
-             "attendees": m.attendees, "decisions": m.decisions}
+             "attendees": m.attendees, "decisions": m.decisions,
+             "meeting_type": m.meeting_type or "other",
+             "sentiment": m.sentiment or "unknown",
+             "audio_processing_status": m.audio_processing_status or "idle",
+             "competitors_mentioned": m.competitors_mentioned or "",
+             "pricing_mentioned": m.pricing_mentioned or "",
+             "has_transcript": bool(m.transcript)}
             for m in meetings
         ],
         "action_items": [
@@ -3681,5 +3687,119 @@ async def integrations_microsoft_disconnect():
     await microsoft_auth.disconnect()
     await _audit("integrations.microsoft.disconnect", {}, summary="microsoft tokens cleared")
     return {"ok": True}
+
+
+# =====================================================================
+# Audio capture — upload a recording (any source: phone voice memo, browser
+# recording, Otter export). Whisper transcribes, Haiku categorizes,
+# extractions get applied or surfaced for one-click apply.
+# =====================================================================
+
+
+_AUDIO_MAX_BYTES = 25 * 1024 * 1024  # Whisper's hard cap is 25MB
+
+
+async def _process_audio_upload(meeting_id: str, file: UploadFile) -> dict:
+    """Shared body for both upload endpoints — read file, kick off pipeline."""
+    from .. import main as app_module
+    from ..core.audio_processor import process_meeting_audio
+
+    settings = getattr(app_module, "settings", None)
+    agent = getattr(app_module, "agent", None)
+    llm_client = getattr(agent, "client", None) if agent else None
+
+    if not settings or not settings.openai_api_key:
+        raise HTTPException(503, "OPENAI_API_KEY not configured — required for transcription")
+    if llm_client is None:
+        raise HTTPException(503, "Agent LLM not ready")
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "empty audio file")
+    if len(raw) > _AUDIO_MAX_BYTES:
+        raise HTTPException(413, f"audio file exceeds {_AUDIO_MAX_BYTES // (1024*1024)}MB limit")
+
+    fast_model = getattr(settings, "fast_model", "claude-haiku-4-5")
+    try:
+        result = await process_meeting_audio(
+            meeting_id=meeting_id,
+            audio_bytes=raw,
+            filename=file.filename or "audio.webm",
+            session_maker=_sm,
+            llm_client=llm_client,
+            openai_api_key=settings.openai_api_key,
+            fast_model=fast_model,
+        )
+    except Exception as e:
+        await _audit("audio.process.error", {"meeting_id": meeting_id, "filename": file.filename},
+                     status="error", summary=str(e)[:300])
+        raise HTTPException(500, f"audio processing failed: {e}")
+
+    await _audit("audio.process.done", {"meeting_id": meeting_id, "filename": file.filename},
+                 summary=f"transcript {len(result['transcript'])} chars; type={result.get('extracted', {}).get('meeting_type', '?')}")
+    return result
+
+
+@router.post("/meetings/{meeting_id}/audio")
+async def upload_meeting_audio(meeting_id: str, file: UploadFile = File(...)):
+    """Upload audio to an existing meeting; transcribe + categorize in-place.
+
+    Status updates land on the Meeting row (audio_processing_status field)
+    so the UI can poll. Returns the transcript + extracted suggestions
+    when done."""
+    from ..db.models import Meeting
+    async with _sm() as s:
+        if not await s.get(Meeting, meeting_id):
+            raise HTTPException(404, "meeting not found")
+    return await _process_audio_upload(meeting_id, file)
+
+
+@router.post("/deals/{deal_id}/audio")
+async def upload_deal_audio(
+    deal_id: str,
+    file: UploadFile = File(...),
+    attendees: str = Form(""),
+):
+    """One-shot: create a new Meeting on this deal AND upload audio in
+    a single call. Used by the deal-page record/upload widget so the
+    user doesn't have to first 'log meeting' then upload."""
+    from datetime import datetime as _dt, timezone as _tz
+    from ..db.models import Deal, Meeting
+    async with _sm() as s:
+        if not await s.get(Deal, deal_id):
+            raise HTTPException(404, "deal not found")
+        m = Meeting(
+            deal_id=deal_id,
+            attendees=attendees,
+            date=_dt.now(_tz.utc),
+            audio_processing_status="uploaded",
+        )
+        s.add(m)
+        await s.commit()
+        await s.refresh(m)
+        meeting_id = m.id
+    return await _process_audio_upload(meeting_id, file)
+
+
+@router.get("/meetings/{meeting_id}/processing")
+async def meeting_processing_status(meeting_id: str):
+    """Lightweight poll endpoint — returns current processing state +
+    extracted fields if done. Avoids re-transferring the full transcript."""
+    from ..db.models import Meeting
+    async with _sm() as s:
+        m = await s.get(Meeting, meeting_id)
+        if not m:
+            raise HTTPException(404, "meeting not found")
+        return {
+            "id": m.id,
+            "status": m.audio_processing_status,
+            "error": m.audio_processing_error or None,
+            "meeting_type": m.meeting_type,
+            "sentiment": m.sentiment,
+            "duration_minutes": m.duration_minutes,
+            "competitors_mentioned": m.competitors_mentioned or "",
+            "pricing_mentioned": m.pricing_mentioned or "",
+            "has_transcript": bool(m.transcript),
+        }
 
 

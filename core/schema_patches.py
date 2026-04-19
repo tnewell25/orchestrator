@@ -48,6 +48,15 @@ _COLUMN_PATCHES: list[tuple[str, str]] = [
     # multi-site industrial customers like Bosch/Honeywell).
     ("deals", "plant_id VARCHAR REFERENCES plants(id) ON DELETE SET NULL"),
     ("bids", "plant_id VARCHAR REFERENCES plants(id) ON DELETE SET NULL"),
+
+    # Meeting capture + auto-categorization (Phase 1).
+    ("meetings", "meeting_type VARCHAR DEFAULT 'other'"),
+    ("meetings", "sentiment VARCHAR DEFAULT 'unknown'"),
+    ("meetings", "duration_minutes FLOAT DEFAULT 0.0"),
+    ("meetings", "audio_processing_status VARCHAR DEFAULT 'idle'"),
+    ("meetings", "audio_processing_error VARCHAR(500) DEFAULT ''"),
+    ("meetings", "competitors_mentioned TEXT DEFAULT ''"),
+    ("meetings", "pricing_mentioned TEXT DEFAULT ''"),
 ]
 
 

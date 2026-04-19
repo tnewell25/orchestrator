@@ -221,11 +221,46 @@ class TelegramBot:
             await update.message.reply_text("Couldn't transcribe that.")
             return
 
+        # For longer recordings (meeting-length, ≥600 chars ≈ 60+s), pre-run
+        # the structured categorizer so the agent receives pre-extracted
+        # meeting_type / decisions / action items / MEDDIC deltas / competitor
+        # mentions instead of having to extract them itself. Big quality jump
+        # on long transcripts; matches the "Jamie" pattern users expect.
+        is_long = len(transcript) >= 600
+        structured_block = ""
+        if is_long:
+            try:
+                from ..core.audio_processor import categorize_transcript
+                cat = await categorize_transcript(
+                    transcript=transcript,
+                    deal_context="(Telegram voice note — caller must identify deal from transcript content)",
+                    llm_client=self.agent.client,
+                    model=self.settings.fast_model,
+                )
+                if cat:
+                    structured_block = (
+                        "\n\n[PRE-EXTRACTED CATEGORIZATION]\n"
+                        f"meeting_type: {cat.get('meeting_type', 'other')}\n"
+                        f"sentiment: {cat.get('sentiment', 'unknown')}\n"
+                        f"summary: {cat.get('summary', '')}\n"
+                        f"attendees_mentioned: {', '.join(cat.get('attendees_mentioned', []))}\n"
+                        f"key_decisions: {'; '.join(cat.get('key_decisions', []))}\n"
+                        f"action_items: {'; '.join(a.get('description', '') for a in cat.get('action_items', []))}\n"
+                        f"competitors_mentioned: {', '.join(cat.get('competitors_mentioned', []))}\n"
+                        f"pricing_mentioned: {cat.get('pricing_mentioned', '')}\n"
+                        f"meddic_deltas: {cat.get('meddic_deltas', {})}\n"
+                    )
+            except Exception as e:
+                logger.warning("Pre-categorization failed (continuing with raw transcript): %s", e)
+
         prompt = (
-            f"[VOICE NOTE TRANSCRIPT]\n{transcript}\n\n"
-            "Extract and file: meeting summary, attendees, decisions, commitments "
-            "(as action items with due dates), competitor mentions, any personal "
-            "details about contacts. Then confirm what you captured."
+            f"[VOICE NOTE TRANSCRIPT]\n{transcript}\n"
+            f"{structured_block}\n"
+            "File this. Identify the deal from the transcript content (call DealSkill.find), "
+            "then log a Meeting with the summary/attendees/decisions, create action items "
+            "for each commitment with due dates, append any MEDDIC field updates, and "
+            "update personal_notes on contacts mentioned. Confirm what you captured "
+            "in 1-2 sentences."
         )
         try:
             response = await self.agent.run(

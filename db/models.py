@@ -349,6 +349,20 @@ class Meeting(Base):
     transcript = Column(Text, default="")  # raw voice-note transcript if any
     created_at = Column(DateTime(timezone=True), default=_now)
 
+    # Categorization (auto-set by audio_processor or settable via API).
+    # meeting_type: discovery | technical_deep_dive | pricing | negotiation |
+    #               status | kickoff | closing | other
+    meeting_type = Column(String, default="other", index=True)
+    # sentiment: positive | neutral | concerning | unknown
+    sentiment = Column(String, default="unknown")
+    duration_minutes = Column(Float, default=0.0)
+    # audio_processing_status: idle | uploaded | transcribing | categorizing |
+    #                          done | failed
+    audio_processing_status = Column(String, default="idle", index=True)
+    audio_processing_error = Column(String(500), default="")
+    competitors_mentioned = Column(Text, default="")  # comma-separated
+    pricing_mentioned = Column(Text, default="")       # one-line summary
+
     deal = relationship("Deal", back_populates="meetings")
 
 
